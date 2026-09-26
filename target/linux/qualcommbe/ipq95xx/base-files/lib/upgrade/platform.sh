@@ -94,7 +94,7 @@ platform_do_upgrade() {
 		CI_DATAPART="rootfs_data"
 		emmc_do_upgrade "$1"
 		;;
-	tplink,archer-be800|tplink,archer-be800-sfp)
+	tplink,archer-be800|tplink,archer-be800-sfp|tplink,archer-be800-combo)
 		tplink_do_upgrade "$1"
 		;;
 	*)

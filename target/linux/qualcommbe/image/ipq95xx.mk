@@ -94,3 +94,10 @@ define Device/tplink_archer-be800-sfp
 	SUPPORTED_DEVICES += tplink,archer-be800
 endef
 TARGET_DEVICES += tplink_archer-be800-sfp
+
+define Device/tplink_archer-be800-combo
+	$(call Device/tplink_archer-be800-common)
+	DEVICE_VARIANT := Combo
+	SUPPORTED_DEVICES += tplink,archer-be800 tplink,archer-be800-sfp
+endef
+TARGET_DEVICES += tplink_archer-be800-combo

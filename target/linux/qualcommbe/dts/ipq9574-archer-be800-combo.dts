@@ -1,0 +1,28 @@
+/dts-v1/;
+
+#include "ipq9574-archer-be800-common.dtsi"
+
+/ {
+	model = "TP-Link Archer BE800 Combo";
+	compatible = "tplink,archer-be800-combo", "qcom,ipq9574";
+};
+
+&phy5 {
+	status = "okay";
+};
+
+&xgmac6 {
+	phy-mode = "usxgmii";
+	managed = "in-band-status";
+	phy-handle = <&phy5>;
+	sfp = <&sfp0>;
+	/* Physical medium mux: low = RJ45 (AQR113C), high = SFP */
+	combo-medium-gpios = <&tlmm 40 GPIO_ACTIVE_HIGH>;
+};
+
+&sfp0 {
+	status = "okay";
+};
+
+/* phylink owns the medium mux GPIO on this profile */
+/delete-node/ &sfp_medium;
