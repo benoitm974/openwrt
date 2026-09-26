@@ -1,0 +1,320 @@
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -104,6 +104,14 @@
+ 	DECLARE_PHY_INTERFACE_MASK(sfp_interfaces);
+ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(sfp_support);
+ 	u8 sfp_port;
++	/* combo base PHY + SFP media ownership */
++	bool sfp_base_phy_active;
++	bool sfp_media_owner;
++	struct phy_device *sfp_base_phy;
++	struct fwnode_handle *combo_fwnode;
++	struct gpio_desc *combo_medium_gpio;
++	phy_interface_t sfp_base_interface;
++	u8 sfp_base_port;
+ 
+ 	struct eee_config eee_cfg;
+ };
+@@ -2602,7 +2608,21 @@
+ 
+ 	ret = phylink_bringup_phy(pl, phy_dev, pl->link_config.interface);
+-	if (ret)
++	if (ret) {
+ 		phy_detach(phy_dev);
++	} else if (pl->sfp_bus) {
++		/* remember the base PHY for later restore */
++		pl->sfp_base_phy_active = true;
++		pl->sfp_base_phy = phy_dev;
++		get_device(&phy_dev->mdio.dev);
++		pl->combo_fwnode = (struct fwnode_handle *)fwnode;
++		/* Select the copper medium by default at boot */
++		pl->combo_medium_gpio = fwnode_gpiod_get_index(pl->combo_fwnode,
++					"combo-medium", 0, GPIOD_OUT_LOW,
++					"combo-medium");
++		if (IS_ERR(pl->combo_medium_gpio))
++			pl->combo_medium_gpio = NULL;
++		phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_LINK);
++	}
+ 
+ 	return ret;
+ }
+@@ -2642,6 +2662,154 @@
+ }
+ EXPORT_SYMBOL_GPL(phylink_disconnect_phy);
+ 
++static struct gpio_desc *phylink_combo_medium_gpio(struct phylink *pl)
++{
++	struct gpio_desc *desc;
++
++	if (pl->combo_medium_gpio)
++		return pl->combo_medium_gpio;
++	if (!pl->combo_fwnode)
++		return NULL;
++
++	desc = fwnode_gpiod_get_index(pl->combo_fwnode, "combo-medium",
++				      0, GPIOD_OUT_LOW, "combo-medium");
++	if (IS_ERR(desc))
++		return NULL;
++
++	pl->combo_medium_gpio = desc;
++	return desc;
++}
++
++/*
++ * Support combo ports that have both a fixed base PHY (phy-handle) and an
++ * SFP cage on the same MAC: media ownership is transferred to the SFP
++ * module when a module is detected and returned to the base PHY when the
++ * module goes away.  The sfp callbacks run from work without rtnl held,
++ * like the existing phylink sfp callbacks.
++ */
++static int phylink_sfp_detach_base_phy(struct phylink *pl)
++{
++	struct phy_device *phy;
++
++	if (pl->sfp_media_owner || !pl->phydev)
++		return 0;
++
++	if (WARN_ON(!pl->sfp_base_phy_active || !pl->sfp_base_phy))
++		return -EINVAL;
++
++	phylink_info(pl, "combo: detaching base PHY, SFP takes over\n");
++
++	if (phylink_combo_medium_gpio(pl))
++		gpiod_set_value_cansleep(pl->combo_medium_gpio, 1);
++
++	pl->sfp_base_interface = pl->link_interface;
++	pl->sfp_base_port = pl->link_port;
++
++	mutex_lock(&pl->phydev_mutex);
++	phy = pl->phydev;
++	mutex_lock(&phy->lock);
++	mutex_lock(&pl->state_mutex);
++	pl->phydev = NULL;
++	pl->phy_enable_tx_lpi = false;
++	pl->mac_tx_clk_stop = false;
++	mutex_unlock(&pl->state_mutex);
++	mutex_unlock(&phy->lock);
++	mutex_unlock(&pl->phydev_mutex);
++
++	flush_work(&pl->resolve);
++	phy_disconnect(phy);
++
++	/* Force a link-down event: the base PHY state is stale once detached
++	 * and would otherwise be reported until the SFP interface is set.
++	 */
++	pl->link_failed = true;
++
++	pl->sfp_base_phy_active = false;
++	pl->sfp_media_owner = true;
++
++	return 0;
++}
++
++static void phylink_sfp_restore_base_phy(struct phylink *pl)
++{
++	struct phy_device *phy;
++	int ret;
++
++	if (!pl->sfp_media_owner)
++		return;
++
++	pl->sfp_media_owner = false;
++
++	/* detach the SFP module PHY first, if it is still attached */
++	phy = pl->phydev;
++	if (phy && phy->attached_dev) {
++		mutex_lock(&pl->phydev_mutex);
++		mutex_lock(&phy->lock);
++		mutex_lock(&pl->state_mutex);
++		pl->phydev = NULL;
++		pl->phy_enable_tx_lpi = false;
++		pl->mac_tx_clk_stop = false;
++		mutex_unlock(&pl->state_mutex);
++		mutex_unlock(&phy->lock);
++		mutex_unlock(&pl->phydev_mutex);
++
++		flush_work(&pl->resolve);
++		phy_disconnect(phy);
++	} else if (phy) {
++		mutex_lock(&pl->phydev_mutex);
++		pl->phydev = NULL;
++		mutex_unlock(&pl->phydev_mutex);
++	}
++
++	phy = pl->sfp_base_phy;
++	if (!phy) {
++		phylink_err(pl, "combo: no base PHY to restore\n");
++		phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_LINK);
++		return;
++	}
++
++	phylink_info(pl, "combo: restoring base PHY\n");
++
++	if (phylink_combo_medium_gpio(pl))
++		gpiod_set_value_cansleep(pl->combo_medium_gpio, 0);
++
++	pl->link_interface = pl->sfp_base_interface;
++	pl->link_config.interface = pl->sfp_base_interface;
++	pl->req_link_an_mode = pl->cfg_link_an_mode;
++	pl->link_port = pl->sfp_base_port;
++
++	ret = phy_attach_direct(pl->netdev, phy, 0, pl->link_interface);
++	if (ret) {
++		phylink_err(pl, "combo: base PHY reattach failed: %pe\n",
++			    ERR_PTR(ret));
++		phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_LINK);
++		return;
++	}
++
++	ret = phylink_bringup_phy(pl, phy, pl->link_interface);
++	if (ret) {
++		phylink_err(pl, "combo: base PHY bringup failed: %pe\n",
++			    ERR_PTR(ret));
++		phy_detach(phy);
++		phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_LINK);
++		return;
++	}
++
++	pl->sfp_base_phy_active = true;
++
++	if (!test_bit(PHYLINK_DISABLE_STOPPED, &pl->phylink_disable_state))
++		phy_start(phy);
++
++	/* Replay the base interface synchronously; writing link_config before
++	 * the PCS reconfig would otherwise suppress the interface-change major
++	 * config (and a later forced replay races the link-down state).
++	 */
++	phylink_mac_initial_config(pl, false);
++
++	phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_LINK);
++	phylink_info(pl, "combo: base PHY restored\n");
++}
++
+ static void phylink_link_changed(struct phylink *pl, bool up, const char *what)
+ {
+ 	if (!up)
+@@ -4056,6 +4183,7 @@
+ {
+ 	const struct sfp_module_caps *caps;
+ 	struct phylink *pl = upstream;
++	int ret;
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -4069,7 +4197,16 @@
+ 	if (pl->sfp_may_have_phy)
+ 		return 0;
+ 
+-	return phylink_sfp_config_optical(pl);
++	/* transfer media ownership to the SFP module */
++	ret = phylink_sfp_detach_base_phy(pl);
++	if (ret)
++		return ret;
++
++	ret = phylink_sfp_config_optical(pl);
++	if (ret)
++		phylink_sfp_restore_base_phy(pl);
++
++	return ret;
+ }
+ 
+ static void phylink_sfp_module_remove(void *upstream)
+@@ -4082,10 +4219,13 @@
+ static int phylink_sfp_module_start(void *upstream)
+ {
+ 	struct phylink *pl = upstream;
++	int ret;
+ 
+ 	/* If this SFP module has a PHY, start the PHY now. */
+ 	if (pl->phydev) {
+-		phy_start(pl->phydev);
++		/* only start the PHY while the SFP owns media */
++		if (pl->sfp_media_owner)
++			phy_start(pl->phydev);
+ 		return 0;
+ 	}
+ 
+@@ -4095,6 +4235,11 @@
+ 	if (!pl->sfp_may_have_phy)
+ 		return 0;
+ 
++	/* transfer media ownership to the SFP module */
++	ret = phylink_sfp_detach_base_phy(pl);
++	if (ret)
++		return ret;
++
+ 	return phylink_sfp_config_optical(pl);
+ }
+ 
+@@ -4103,14 +4248,30 @@
+ 	struct phylink *pl = upstream;
+ 
+ 	/* If this SFP module has a PHY, stop it. */
+-	if (pl->phydev)
+-		phy_stop(pl->phydev);
++	if (pl->phydev) {
++		/* only stop the PHY while the SFP owns media */
++		if (pl->sfp_media_owner)
++			phy_stop(pl->phydev);
++		return;
++	}
++
++	/* the SFP no longer owns the media (module removed or
++	 * probe error); hand the port back to the base PHY.
++	 */
++	phylink_sfp_restore_base_phy(pl);
+ }
+ 
+ static void phylink_sfp_link_down(void *upstream)
+ {
+ 	struct phylink *pl = upstream;
+ 
++	/* An SFP bus initially reports link down even when the fixed PHY is
++	 * the active medium of a combo port. Keep resolving that PHY until
++	 * ownership is explicitly transferred to the SFP module.
++	 */
++	if (pl->sfp_base_phy_active)
++		return;
++
+ 	ASSERT_RTNL();
+ 
+ 	phylink_run_resolve_and_disable(pl, PHYLINK_DISABLE_LINK);
+@@ -4128,6 +4289,7 @@
+ static int phylink_sfp_connect_phy(void *upstream, struct phy_device *phy)
+ {
+ 	struct phylink *pl = upstream;
++	int ret;
+ 
+ 	if (!phy->drv) {
+ 		phylink_err(pl, "PHY %s (id 0x%.8lx) has no driver loaded\n",
+@@ -4150,13 +4312,28 @@
+ 			  pl->supported_interfaces);
+ 
+ 	/* Do the initial configuration */
+-	return phylink_sfp_config_phy(pl, phy);
++	/* transfer media ownership to the SFP module PHY */
++	ret = phylink_sfp_detach_base_phy(pl);
++	if (ret)
++		return ret;
++
++	ret = phylink_sfp_config_phy(pl, phy);
++	if (ret)
++		phylink_sfp_restore_base_phy(pl);
++
++	return ret;
+ }
+ 
+ static void phylink_sfp_disconnect_phy(void *upstream,
+ 				       struct phy_device *phydev)
+ {
+-	phylink_disconnect_phy(upstream);
++	struct phylink *pl = upstream;
++
++	/* after a base-PHY restore the module PHY is already gone;
++	 * only disconnect while the SFP still owns the media.
++	 */
++	if (pl->sfp_media_owner)
++		phylink_disconnect_phy(pl);
+ }
+ 
+ static const struct sfp_upstream_ops sfp_phylink_ops = {
