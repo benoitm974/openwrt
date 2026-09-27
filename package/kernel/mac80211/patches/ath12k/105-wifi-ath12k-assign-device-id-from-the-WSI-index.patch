@@ -1,0 +1,45 @@
+From 751fb727c53b6418f17c0416d50c5cae4edf242d Mon Sep 17 00:00:00 2001
+From: Benoit Masson <yahoo@perenite.com>
+Date: Mon, 28 Sep 2026 17:41:20 +0200
+Subject: [PATCH] wifi: ath12k: assign device id from the WSI index
+
+Devices of a hardware group are added to ag->ab[] in PCI probe
+completion order (ab->device_id = ag->num_probed++). The wiphy radio
+array is built from ag->ab[] and the wiphy device is taken from its
+first entry, so the wiphy path and the radio index to band mapping
+change on every boot.
+
+Store each ab in ag->ab[] at its wsi_info.index, which is derived from
+the device tree WSI ring. The group order is then deterministic.
+ag->num_probed remains the group device counter. The unassign path is
+unchanged, it already indexes ag->ab[] by ab->device_id.
+
+Verified on TP-Link Archer BE800 (three single-band radios in one
+group): the wiphy path and the radio index to band mapping are
+identical across cold boots.
+
+Fixes: 6f245ea0ec6c ("wifi: ath12k: introduce device group abstraction")
+Cc: stable@vger.kernel.org # 6.14+
+Link: https://lore.kernel.org/linux-wireless/20260928154335.85628-1-yahoo@perenite.com/
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+Changes in v2:
+- Set ab->device_id from wsi_info.index in ath12k_core_hw_group_assign()
+  instead of reordering pdev_map[] in ath12k_mac_allocate(), as suggested
+  by Rameshkumar. mac.c is no longer modified.
+---
+ drivers/net/wireless/ath/ath12k/core.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2029,7 +2029,8 @@ exit:
+ 		goto invalid_group;
+ 	}
+ 
+-	ab->device_id = ag->num_probed++;
++	ag->num_probed++;
++	ab->device_id = wsi->index;
+ 	ag->ab[ab->device_id] = ab;
+ 	ab->ag = ag;
+ 
