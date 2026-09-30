@@ -1,108 +1,116 @@
-![OpenWrt logo](include/logo.png)
+# OpenWrt for the TP-Link Archer BE800 (v1)
 
-OpenWrt Project is a Linux operating system targeting embedded devices. Instead
-of trying to create a single, static firmware, OpenWrt provides a fully
-writable filesystem with package management. This frees you from the
-application selection and configuration provided by the vendor and allows you
-to customize the device through the use of packages to suit any application.
-For developers, OpenWrt is the framework to build an application without having
-to build a complete firmware around it; for users this means the ability for
-full customization, to use the device in ways never envisioned.
+Community **OpenWrt** builds for the **TP-Link Archer BE800 v1** — Qualcomm
+**IPQ9574**, 4× 2.5G + 2× 10G (one an RJ45/SFP combo), tri-band Wi-Fi 7
+(QCN9274-family radios via ath12k), 256 MiB NAND (UBIFS).
 
-Sunshine!
+> [!WARNING]
+> **Unofficial, community-maintained firmware — not affiliated with, endorsed
+> by, or supported by TP-Link or the OpenWrt project.** Provided **as-is, with
+> no warranty of any kind**. Flashing third-party firmware carries real risk,
+> including bricking the device and voiding your warranty. **Back up your
+> router's `tp_data` partition first** — it holds your unit's unique MAC
+> addresses and calibration data and cannot be recovered. If this router
+> matters to you, test on a spare unit before relying on it.
+>
+> Several pieces of this tree are **not upstream OpenWrt** and may never merge
+> as-is (details below). You are running borrowed, work-in-progress code.
 
-## Download
+## Why this fork exists
 
-Built firmware images are available for many architectures and come with a
-package selection to be used as WiFi home router. To quickly find a factory
-image usable to migrate from a vendor stock firmware to OpenWrt, try the
-*Firmware Selector*.
+The BE800 is not in OpenWrt main yet. This tree rides on top of
+[sidhantgoel/openwrt](https://github.com/sidhantgoel/openwrt) branch
+`be800v1-2` ([openwrt/openwrt#20373](https://github.com/openwrt/openwrt/pull/20373))
+and waits on a chain of open PRs:
 
-* [OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)
+- Device support: [openwrt/openwrt#20373](https://github.com/openwrt/openwrt/pull/20373)
+- Wi-Fi board data (BDF): [openwrt/firmware_qca-wireless#159](https://github.com/openwrt/firmware_qca-wireless/pull/159)
+- First-boot network fix: [sidhantgoel/openwrt#6](https://github.com/sidhantgoel/openwrt/pull/6)
 
-If your device is supported, please follow the **Info** link to see install
-instructions or consult the support resources listed below.
+As PRs merge, this branch rebases and the local deltas shrink.
 
-##
+## Hardware acceleration (PPE flow offload) — borrowed from Flint 3
 
-An advanced user may require additional or specific package. (Toolchain, SDK, ...) For everything else than simple firmware download, try the wiki download page:
+The headline feature of these builds is **hardware NAT/routing offload through
+the IPQ9574 PPE**, driven by the kernel's netfilter flowtable
+(`flow_offloading_hw`). That work is **not ours and not upstream**: it is the
+PPE offload series written by **Kamil Bienkiewicz** for the GL.iNet Flint 3
+(IPQ5332) — see [perceival/openwrt-flint3](https://github.com/perceival/openwrt-flint3)
+(branch `flint3-be9300`, patches 0411–0446) — ported here to the IPQ9574
+driver, with porting notes and findings in
+[perceival/openwrt-flint3#98](https://github.com/perceival/openwrt-flint3/issues/98).
+The same flowtable-driven model was pioneered upstream for MediaTek
+(`mtk_ppe`) and is proposed for older Qualcomm PPEs in
+[openwrt/openwrt#24806](https://github.com/openwrt/openwrt/pull/24806).
 
-* [OpenWrt Wiki Download](https://openwrt.org/downloads)
+Measured on one BE800 (iperf3, 2.5G link, NAT): **2.35 Gbit/s line rate in
+both directions at ~2.4% router CPU** (~15.7% CPU with offload off). See the
+flint3 issue above for details. All credit for the offload belongs to its
+author; this fork only ported and tested it.
 
-## Development
+## Status
 
-To build your own firmware you need a GNU/Linux, BSD or macOS system (case
-sensitive filesystem required). Cygwin is unsupported because of the lack of a
-case sensitive file system.
+| Subsystem | State |
+|---|---|
+| Boot / procd / SSH / LuCI | working |
+| 4× 2.5G LAN + 2.5G WAN (combo RJ45) | working |
+| 10G SFP in the combo cage (DAC) | working, live RJ45↔SFP switching |
+| 10G RJ45 port (AQR113C) | working |
+| Wi-Fi 7, all three bands (ath12k) | working; radio order stabilized by a local patch (see known issues) |
+| Routed + NAT forwarding | working |
+| **PPE hardware NAT/routing offload** | **working** (see above) |
+| LED matrix (front panel) | supported by `ledmatrixd` + LuCI app |
+| Buttons | mapped |
+| UBIFS sysupgrade | working |
 
-### Requirements
+## Known issues
 
-You need the following tools to compile OpenWrt, the package names vary between
-distributions. A complete list with distribution specific packages is found in
-the [Build System Setup](https://openwrt.org/docs/guide-developer/build-system/install-buildsystem)
-documentation.
+- **Radio order used to shuffle per boot** (ath12k WSI): which UCI radio maps
+  to which band could rotate across reboots — upstream issue
+  [openwrt/openwrt#24949](https://github.com/openwrt/openwrt/issues/24949).
+  This branch carries a local fix (`mac80211: ath12k: assign device id from
+  the WSI index`) that pins the mapping; until it is upstreamed, expect the
+  issue to reappear on other trees/forks.
+- **Squashfs images do not boot** on this layout — **UBIFS only** (use the
+  `-ubifs-` artifacts).
+- **Combo port**: RJ45 and SFP cage share one port; inserting an SFP module
+  takes over from the RJ45 automatically.
+- Hardware offload is young silicon-driving code: if anything behaves oddly,
+  try `uci set firewall.@defaults[0].flow_offloading_hw='0'` and report.
 
+## Flashing
+
+From **stock TP-Link firmware**: use the web UI and the
+`...-ubifs-web-ui-factory.bin` image (or `factory.ubi`).
+
+From **OpenWrt**: `sysupgrade -F` the `-ubifs-sysupgrade.bin` image
+(**keep settings only from the same branch**; when coming from a very
+different build, add `-n` for a clean config).
+
+Rollback to a previous slot is possible from the serial console
+(u-boot `tp_boot_idx`), serial is 115200 8N1 on the internal header.
+
+## Building
+
+```sh
+git clone -b be800-community https://github.com/benoitm974/openwrt.git
+cd openwrt
+./scripts/feeds update -a && ./scripts/feeds install -a
+make menuconfig     # Target: Qualcomm Atheros 802.11be / ipq95xx / tplink_archer-be800-combo
+make -j"$(nproc)"
 ```
-binutils bzip2 diff find flex gawk gcc-6+ getopt grep install libc-dev libz-dev
-make4.1+ perl python3.8+ rsync subversion unzip which
-```
 
-### Quickstart
+Images land in `bin/targets/qualcommbe/ipq95xx/`.
 
-1. Run `./scripts/feeds update -a` to obtain all the latest package definitions
-   defined in feeds.conf / feeds.conf.default
+## Credits
 
-2. Run `./scripts/feeds install -a` to install symlinks for all obtained
-   packages into package/feeds/
-
-3. Run `make menuconfig` to select your preferred configuration for the
-   toolchain, target system & firmware packages.
-
-4. Run `make` to build your firmware. This will download all sources, build the
-   cross-compile toolchain and then cross-compile the GNU/Linux kernel & all chosen
-   applications for your target system.
-
-### Related Repositories
-
-The main repository uses multiple sub-repositories to manage packages of
-different categories. All packages are installed via the OpenWrt package
-manager called `opkg`. If you're looking to develop the web interface or port
-packages to OpenWrt, please find the fitting repository below.
-
-* [LuCI Web Interface](https://github.com/openwrt/luci): Modern and modular
-  interface to control the device via a web browser.
-
-* [OpenWrt Packages](https://github.com/openwrt/packages): Community repository
-  of ported packages.
-
-* [OpenWrt Routing](https://github.com/openwrt/routing): Packages specifically
-  focused on (mesh) routing.
-
-* [OpenWrt Video](https://github.com/openwrt/video): Packages specifically
-  focused on display servers and clients (Xorg and Wayland).
-
-## Support Information
-
-For a list of supported devices see the [OpenWrt Hardware Database](https://openwrt.org/supported_devices)
-
-### Documentation
-
-* [Quick Start Guide](https://openwrt.org/docs/guide-quick-start/start)
-* [User Guide](https://openwrt.org/docs/guide-user/start)
-* [Developer Documentation](https://openwrt.org/docs/guide-developer/start)
-* [Technical Reference](https://openwrt.org/docs/techref/start)
-
-### Support Community
-
-* [Forum](https://forum.openwrt.org): For usage, projects, discussions and hardware advise.
-* [Support Chat](https://webchat.oftc.net/#openwrt): Channel `#openwrt` on **oftc.net**.
-
-### Developer Community
-
-* [Bug Reports](https://bugs.openwrt.org): Report bugs in OpenWrt
-* [Dev Mailing List](https://lists.openwrt.org/mailman/listinfo/openwrt-devel): Send patches
-* [Dev Chat](https://webchat.oftc.net/#openwrt-devel): Channel `#openwrt-devel` on **oftc.net**.
+- **Sidhant Goel** — the BE800 device port this is built on (#20373)
+- **Kamil Bienkiewicz (perceival)** — the PPE flowtable offload series (flint3)
+- **JuliusBairaktaris** — flowtable-driven PPE offload reference for Qualcomm (#24806)
+- OpenWrt developers for everything else
 
 ## License
 
-OpenWrt is licensed under GPL-2.0
+Individual files retain their upstream licenses (GPL-2.0-only for kernel
+patches, GPL-2.0+ / MIT / ISC / BSD as marked). PPE register data derives
+from the ISC-licensed qca-ssdk headers.
