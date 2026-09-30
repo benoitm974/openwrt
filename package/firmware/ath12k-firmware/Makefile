@@ -5,10 +5,14 @@ PKG_NAME:=ath12k-firmware
 PKG_MAINTAINER:=Sidhant Goel <sidhant@hexcod.in>
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE.qca_firmware
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=git@github.com:sidhantgoel/firmware_qca-wireless.git
+# Single source for both the firmware-2.bin override and the BDF
+# (board-tplink_archer-be800.qcn9274). Switch to
+# openwrt/firmware_qca-wireless once both files are merged there
+# (BDF: PR 159; AMSS override: not yet submitted).
+PKG_SOURCE_URL:=https://github.com/sidhantgoel/firmware_qca-wireless.git
 PKG_SOURCE_DATE:=2026-03-03
 PKG_SOURCE_VERSION:=c7b7a979b30e9fbaf2c41b4ad96a4c4d67846927
 PKG_MIRROR_HASH:=446cd7b9892f531bc665b618f11e3abfc907271cdc407fafe794891520c0affd
@@ -43,9 +47,16 @@ define ath12k-install-firmware-one-to
   $(INSTALL_DATA) $(1) $(2)/lib/firmware/ath12k/$(3)/firmware-2.bin
 endef
 
+define ath12k-install-board-one-to
+  $(INSTALL_DIR)  $(2)/lib/firmware/ath12k/$(3)/
+  $(INSTALL_DATA) $(1) $(2)/lib/firmware/ath12k/$(3)/board-2.bin
+endef
+
 define ath12k-install-firmware-one
   $(if $(filter $(suffix $(1)),.QCN9274 .qcn9274),\
-    $(call ath12k-install-firmware-one-to,$(1),$(2),QCN9274/hw2.0),\
+    $(if $(filter board-%,$(notdir $(1))),\
+      $(call ath12k-install-board-one-to,$(1),$(2),QCN9274/hw2.0),\
+      $(call ath12k-install-firmware-one-to,$(1),$(2),QCN9274/hw2.0)),\
     $(error Unrecognized board-file suffix '$(suffix $(1))' for '$(1)')\
   )
 
@@ -72,7 +83,7 @@ Do not install it for any other device!
   endef
 
   define Package/ath12k-firmware-$(1)/install-overlay
-    $$$$(foreach ATH12K_FIRMWARE_FILE,$$$$(wildcard $(PKG_BUILD_DIR)/firmware-$(1).*),\
+    $$$$(foreach ATH12K_FIRMWARE_FILE,$$$$(wildcard $(PKG_BUILD_DIR)/firmware-$(1).* $(PKG_BUILD_DIR)/board-$(1).*),\
       $$$$(call ath12k-install-firmware-one,$$$$(ATH12K_FIRMWARE_FILE),$$(1)))
   endef
 
