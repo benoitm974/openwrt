@@ -4564,7 +4564,7 @@ diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h b/drivers/net/ethernet/
 + * IPQ807x (HPPE) "#else" ones. On APPE, 0x2004bc (the HPPE host op
 + * address) is FLOW_CTRL1 instead.
 + */
-+#define PPE_IN_FLOW_TBL_ENTRIES			2048
++#define PPE_IN_FLOW_TBL_ENTRIES			4096
 +
 +/* Per-flow hit counters, indexed by the flow table entry index.
 + *
