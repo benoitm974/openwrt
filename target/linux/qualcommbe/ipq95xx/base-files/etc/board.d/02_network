@@ -17,7 +17,7 @@ ipq95xx_setup_interfaces()
 	qcom,ipq9574-ap-al02-c7)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5" "wan"
 		;;
-	tplink,archer-be800|tplink,archer-be800-sfp)
+	tplink,archer-be800|tplink,archer-be800-sfp|tplink,archer-be800-combo)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5" "wan"
 		;;
 	*)
@@ -35,7 +35,7 @@ ipq95xx_setup_wlan()
 	local board="$1"
 
 	case "$board" in
-	tplink,archer-be800|tplink,archer-be800-sfp)
+	askey,sbe1v1k|tplink,archer-be800|tplink,archer-be800-sfp|tplink,archer-be800-combo)
 		ucidef_add_wlan "$DEV_PATH_PCIE0" "$DEV_PATH_PCIE1" "$DEV_PATH_PCIE2"
 		;;
 	esac
