@@ -539,7 +539,7 @@ diff -ruN a/drivers/net/ethernet/qualcomm/ppe/edma_port.c b/drivers/net/ethernet
  	return features;
  }
  
-@@ -281,6 +693,87 @@
+@@ -281,6 +693,92 @@
  	ppe_port_get_stats64(port_priv->ppe_port, stats);
  }
  
@@ -602,7 +602,12 @@ diff -ruN a/drivers/net/ethernet/qualcomm/ppe/edma_port.c b/drivers/net/ethernet
 +	in.mtu = mtu;
 +	in.mru_ipv6 = mtu;
 +	in.mtu_ipv6 = mtu;
-+	in.mac_bitmap = BIT(my_mac);
++	/* Accept any router MAC (all MY_MAC entries) on ingress: frames whose
++	 * DMAC is another port's/router MAC must reach the CPU instead of
++	 * being L2-switched per the FDB (QSDK accumulates mac_bitmap per
++	 * interface and its bridge mgr adds group MACs to every member).
++	 */
++	in.mac_bitmap = GENMASK(PPE_MY_MAC_TBL_ENTRIES - 1, 0);
 +	in.ipv4_uc_route_en = true;
 +	/* Hardware decrements the TTL, so an expired one must come back
 +	 * to the CPU (which answers it) rather than being forwarded.
