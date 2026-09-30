@@ -1,0 +1,96 @@
+name: BE800 community build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dot /opt/ghc /usr/local/.ghcup || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-be800-${{ github.sha }}
+          restore-keys: ccache-be800-
+
+      - name: Install host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential subversion libncurses-dev \
+            libssl-dev python3-pyelftools python3-setuptools python3-dev swig rsync \
+            libxml-parser-perl time ccache
+          mkdir -p dl
+
+      - name: Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          printf '%s\n' \
+            'CONFIG_TARGET_qualcommbe=y' \
+            'CONFIG_TARGET_qualcommbe_ipq95xx=y' \
+            'CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_tplink_archer-be800-combo=y' \
+            'CONFIG_CCACHE=y' \
+            'CONFIG_PACKAGE_i2c-tools=y' \
+            'CONFIG_PACKAGE_strace=y' \
+            'CONFIG_PACKAGE_ledmatrixd=y' \
+            'CONFIG_PACKAGE_luci-app-ledmatrix=y' \
+            'CONFIG_PACKAGE_kmod-usb-storage=y' \
+            'CONFIG_PACKAGE_kmod-fs-vfat=y' \
+            'CONFIG_PACKAGE_kmod-phy-realtek=m' \
+            'CONFIG_PACKAGE_rtl826x-firmware=m' \
+            'CONFIG_PACKAGE_iperf3=y' \
+            'CONFIG_PACKAGE_luci=y' > .config
+          make defconfig
+          grep "^CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_tplink_archer-be800-combo=y" .config
+
+      - name: Build
+        run: |
+          make -j"$(nproc)" download
+          make -j"$(nproc)"
+
+      - name: Collect artifacts
+        run: |
+          cd bin/targets/qualcommbe/ipq95xx/
+          mkdir -p /work/out
+          cp *be800-combo-ubifs-sysupgrade.bin \
+             *be800-combo-ubifs-factory.ubi \
+             *be800-combo-ubifs-web-ui-factory.bin \
+             *be800-combo.manifest \
+             sha256sums version.buildinfo /work/out/ || true
+          ls -la /work/out
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: be800-images
+          path: /work/out/*
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" --title "Archer BE800 $TAG" --notes "Community OpenWrt build for the TP-Link Archer BE800 v1 (IPQ9574). See the README on the be800-community branch for warnings, flashing instructions and credits.
+
+          - *-ubifs-web-ui-factory.bin — flash from the stock TP-Link web UI
+          - *-ubifs-factory.ubi — factory image (TFTP/recovery)
+          - *-ubifs-sysupgrade.bin — upgrade an existing OpenWrt install (sysupgrade -F)" || true
+          gh release upload "$TAG" /work/out/* --clobber
