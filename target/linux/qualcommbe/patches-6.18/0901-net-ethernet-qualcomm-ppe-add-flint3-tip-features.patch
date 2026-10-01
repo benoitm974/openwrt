@@ -1,0 +1,3298 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: flint3 tip features (0448-0456)
+
+Port of perceival/openwrt-flint3 flint3-be9300 patches 0448-0456 on top
+of our 0900 series port (all by Kamil Bienkiewicz):
+
+- 0448 L4 port mangle in packet byte order
+- 0449 reply-direction offload towards DSA user ports
+- 0450 follow bridge FDB moves for port-addressed flows
+- 0451 routed IPv6 flow offload
+- 0452 re-arm a flow whose hardware entry stopped matching
+- 0453 stop following a flapping address
+- 0454 IPv6 flow-entry lifecycle self-test at init
+- 0455 say when the flow table is full
+- 0456 quiet flow re-arms while the table is full
+
+Skipped: 0447 (mdio-ipq4019 busy-spin, Flint3 RTL8372N-specific polish,
+not needed on the BE800). Port fix: include <linux/device.h> in
+ppe_flow.c for dev_warn on 6.18.44.
+
+Upstream-Status: inappropriate / WIP port - see docs/be800-ppe-offload.md
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+[BE800 port]
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/edma_port.c b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c	2026-10-01 16:58:27.330008428 +0000
+@@ -137,8 +137,10 @@
+  * the (non-conduit) WAN port still reaches the CPU intact (ARP requests to
+  * the WAN address answered 10/10), and a VLAN-tagged WAN (wan.10) behaves
+  * exactly as under the 802.1Q tagger. With the ingress C-TPID at 0x0000 an
+- * 802.1Q tag arriving on the WAN is only parsed if the hardware matches
+- * 0x8100 natively; a WAN-ingress offload milestone has to check that.
++ * 802.1Q tag arriving on the WAN is not parsed as a VLAN (measured: flows
++ * entering through a tagged WAN never hit in hardware), so ppe_offload.c
++ * declines such flows while the alias is active,
++ * see edma_port_parser_alias_active().
+  */
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ /* PPE port that owns the chip-wide alias, or -1. One PPE per SoC. */
+@@ -151,6 +153,10 @@
+ 	u32 in_tpid, eg_tpid, cpu_eg;
+ 	int ret;
+ 
++	/* The conduit's own egress VLAN entry is written last, below. */
++	if (WARN_ON_ONCE(ppe_port->port_id >= PPE_PORT_EG_VLAN_TBL_ENTRIES))
++		return -EINVAL;
++
+ 	if (rtl8_4) {
+ 		in_tpid = FIELD_PREP(PPE_VLAN_TPID_STAG, ETH_P_REALTEK) |
+ 			  FIELD_PREP(PPE_VLAN_TPID_CTAG, 0);
+@@ -191,13 +197,44 @@
+ 		return ret;
+ 
+ 	/* PPE port 0 is the CPU port (EDMA_CPU_PORT_PROFILE_ID). */
++	ret = regmap_update_bits(regmap,
++				 PPE_PORT_EG_VLAN_TBL_ADDR +
++				 PPE_PORT_EG_VLAN_TBL_INC * EDMA_CPU_PORT_PROFILE_ID,
++				 PPE_PORT_EG_VLAN_TBL_VLAN_TYPE |
++				 PPE_PORT_EG_VLAN_TBL_CTAG_MODE |
++				 PPE_PORT_EG_VLAN_TBL_STAG_MODE |
++				 PPE_PORT_EG_VLAN_TBL_VSI_TAG_MODE_EN, cpu_eg);
++	if (ret)
++		return ret;
++
++	/* The conduit itself becomes an S-VLAN port too, keeping its
++	 * per-VSI tag modes: a routed flow's nexthop can then insert the
++	 * S-tag + C-tag pair that emulates the head tag towards the switch
++	 * (ppe_offload.c). Measured on a GL-BE9300: with the port left a
++	 * C-VLAN port the switch delivered nothing for such flows, with this
++	 * bit set the same flows ran at 2353 Mbit/s, and DHCP, ARP and the
++	 * software path were unaffected either way.
++	 */
+ 	return regmap_update_bits(regmap,
+ 				  PPE_PORT_EG_VLAN_TBL_ADDR +
+-				  PPE_PORT_EG_VLAN_TBL_INC * EDMA_CPU_PORT_PROFILE_ID,
+-				  PPE_PORT_EG_VLAN_TBL_VLAN_TYPE |
+-				  PPE_PORT_EG_VLAN_TBL_CTAG_MODE |
+-				  PPE_PORT_EG_VLAN_TBL_STAG_MODE |
+-				  PPE_PORT_EG_VLAN_TBL_VSI_TAG_MODE_EN, cpu_eg);
++				  PPE_PORT_EG_VLAN_TBL_INC * ppe_port->port_id,
++				  PPE_PORT_EG_VLAN_TBL_VLAN_TYPE,
++				  rtl8_4 ? PPE_PORT_EG_VLAN_TBL_VLAN_TYPE : 0);
++}
++
++/**
++ * edma_port_parser_alias_active() - Whether the rtl8_4 parser alias is on.
++ *
++ * The alias is chip-wide (one owner), and while it holds, the ingress
++ * C-TPID is 0x0000 on every port: an 802.1Q tag arriving on the WAN is
++ * not parsed as a VLAN at all. Measured on a GL-BE9300: flows entering
++ * through a VLAN-tagged WAN then never hit in hardware.
++ *
++ * Return: true while a conduit owns the alias.
++ */
++bool edma_port_parser_alias_active(void)
++{
++	return READ_ONCE(edma_parser_alias_owner) >= 0;
+ }
+ #endif
+ 
+@@ -213,15 +250,6 @@
+ 				  core ? PPE_PORT_PARSING_PORT_ROLE : 0);
+ }
+ 
+-/* Parser programming states per port (edma_port_priv.parser_state). */
+-enum edma_parser_state {
+-	EDMA_PARSER_UNSET,	/* never programmed since open */
+-	EDMA_PARSER_PLAIN,	/* edge role, no DSA involvement */
+-	EDMA_PARSER_DSA_8021Q,	/* DSA conduit, reset TPIDs (802.1Q-based tagger) */
+-	EDMA_PARSER_DSA_RTL8_4,	/* DSA conduit, rtl8_4 alias active */
+-	EDMA_PARSER_DENIED,	/* wanted the alias, another port owns it (logged once) */
+-};
+-
+ /* Called from ndo_open (before the link comes up) and again from the
+  * netdevice notifier whenever DSA may have attached or changed the tagger
+  * behind an already-running port. Idempotent: nothing is written unless
+@@ -257,7 +285,7 @@
+ 		ret = edma_port_parser_alias_program(ppe_port, false);
+ 		if (ret)
+ 			return ret;
+-		edma_parser_alias_owner = -1;
++		WRITE_ONCE(edma_parser_alias_owner, -1);
+ 	}
+ 
+ 	if (dsa) {
+@@ -278,7 +306,7 @@
+ 			return ret;
+ 		}
+ 
+-		edma_parser_alias_owner = rtl8_4 ? ppe_port->port_id : -1;
++		WRITE_ONCE(edma_parser_alias_owner, rtl8_4 ? ppe_port->port_id : -1);
+ 	}
+ #endif
+ 
+@@ -287,7 +315,7 @@
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 		if (edma_parser_alias_owner == ppe_port->port_id) {
+ 			edma_port_parser_alias_program(ppe_port, false);
+-			edma_parser_alias_owner = -1;
++			WRITE_ONCE(edma_parser_alias_owner, -1);
+ 		}
+ #endif
+ 		return ret;
+@@ -314,7 +342,7 @@
+ 		ret = edma_port_parser_alias_program(ppe_port, false);
+ 		if (ret)
+ 			netdev_err(netdev, "failed to restore the PPE parser TPIDs: %d\n", ret);
+-		edma_parser_alias_owner = -1;
++		WRITE_ONCE(edma_parser_alias_owner, -1);
+ 	}
+ #endif
+ 
+@@ -759,6 +787,7 @@
+ 	 */
+ 	in.mac_bitmap = GENMASK(PPE_MY_MAC_TBL_ENTRIES - 1, 0);
+ 	in.ipv4_uc_route_en = true;
++	in.ipv6_uc_route_en = true;
+ 	/* Hardware decrements the TTL, so an expired one must come back
+ 	 * to the CPU (which answers it) rather than being forwarded.
+ 	 */
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/edma_port.h b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h	2026-10-01 16:58:26.760008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h	2026-10-01 16:58:27.320008428 +0000
+@@ -93,6 +93,28 @@
+  * packet out through this port, and by a flow entry's src_l3_if when
+  * the packet arrives on it.
+  */
++/**
++ * enum edma_parser_state - What the ingress parser was last programmed
++ * for on a port (struct edma_port_priv::parser_state).
++ * @EDMA_PARSER_UNSET: Never programmed since open.
++ * @EDMA_PARSER_PLAIN: Edge role, no DSA involvement.
++ * @EDMA_PARSER_DSA_8021Q: DSA conduit, reset TPIDs (802.1Q-based tagger).
++ * @EDMA_PARSER_DSA_RTL8_4: DSA conduit, rtl8_4 head tag aliased as QinQ.
++ * @EDMA_PARSER_DENIED: Wanted the alias, another port owns it (logged once).
++ *
++ * Written under RTNL from ndo_open/ndo_stop and the netdevice notifier.
++ * The flow-offload path reads it with READ_ONCE() to pick the egress
++ * encapsulation that matches what the parser, and with it the chip-wide
++ * egress TPIDs, are set to.
++ */
++enum edma_parser_state {
++	EDMA_PARSER_UNSET,
++	EDMA_PARSER_PLAIN,
++	EDMA_PARSER_DSA_8021Q,
++	EDMA_PARSER_DSA_RTL8_4,
++	EDMA_PARSER_DENIED,
++};
++
+ struct edma_port_priv {
+ 	struct ppe_port *ppe_port;
+ 	struct net_device *netdev;
+@@ -106,4 +128,12 @@
+ void edma_port_destroy(struct ppe_port *port);
+ int edma_port_setup(struct ppe_port *port);
+ bool edma_port_is_edma_netdev(const struct net_device *netdev);
++#if IS_ENABLED(CONFIG_NET_DSA)
++bool edma_port_parser_alias_active(void);
++#else
++static inline bool edma_port_parser_alias_active(void)
++{
++	return false;
++}
++#endif
+ #endif
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c	2026-10-01 16:58:26.760008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c	2026-10-01 16:58:27.340008428 +0000
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/device.h>
+ #include <linux/mutex.h>
+ #include <linux/regmap.h>
+ 
+@@ -72,8 +73,13 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* A hash-mode add is refused when no way of the key's bucket is free:
++	 * the only refusal seen on the GL-BE9300, and what callers need to
++	 * tell from a fault. Any other refusal stays -EIO.
++	 */
+ 	if (FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT, rslt))
+-		return -EIO;
++		return op_type == PPE_FLOW_TBL_OP_ADD && mode == PPE_FLOW_OP_MODE_HASH ?
++		       -ENOSPC : -EIO;
+ 
+ 	*index = FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX, rslt);
+ 
+@@ -187,7 +193,9 @@
+  * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
+  * @ppe_dev: PPE device.
+  * @mode: Hash-based or caller-indexed entry placement.
+- * @entry: The flow entry to write, as PPE_FLOW_TBL_ENTRY_WORDS 32-bit words.
++ * @entry: The flow entry to write, as @num_words 32-bit words.
++ * @num_words: Number of words in @entry: PPE_FLOW_TBL_IPV4_ENTRY_WORDS or
++ * PPE_FLOW_TBL_IPV6_ENTRY_WORDS.
+  * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
+  * On success, always holds the entry's final hardware index: unchanged
+  * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
+@@ -195,14 +203,17 @@
+  * Return: 0 on success, a negative error code on failure.
+  */
+ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+-			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index)
++			const u32 *entry, unsigned int num_words, u32 *index)
+ {
++	unsigned int i;
+ 	int ret;
+-	int i;
++
++	if (num_words > PPE_IN_FLOW_TBL_OP_DATA_ENTRIES)
++		return -EINVAL;
+ 
+ 	mutex_lock(&ppe_dev->flow_tbl_lock);
+ 
+-	for (i = 0; i < PPE_FLOW_TBL_ENTRY_WORDS; i++) {
++	for (i = 0; i < num_words; i++) {
+ 		ret = regmap_write(ppe_dev->regmap,
+ 				    PPE_IN_FLOW_TBL_OP_DATA_ADDR + i * PPE_IN_FLOW_TBL_OP_DATA_INC,
+ 				    entry[i]);
+@@ -221,6 +232,17 @@
+ 	 * occupant's lifetime totals to this flow on its first stats poll.
+ 	 */
+ 	ret = ppe_flow_counter_clear(ppe_dev, *index);
++	if (ret) {
++		/* The add has landed; callers treat an error as "nothing
++		 * programmed" and release the entries it points at, so take
++		 * it back out rather than leave a live entry nobody tracks.
++		 */
++		if (ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL,
++					 PPE_FLOW_OP_MODE_INDEX, index))
++			dev_warn(ppe_dev->dev,
++				 "flow entry %u left programmed after a counter clear failure\n",
++				 *index);
++	}
+ out:
+ 	mutex_unlock(&ppe_dev->flow_tbl_lock);
+ 	return ret;
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h	2026-10-01 16:58:27.330008428 +0000
+@@ -10,15 +10,28 @@
+ 
+ #include "ppe.h"
+ 
+-/* Number of 32-bit words that make up one IPv4 5-tuple flow entry.
+- * This is the entry's own size (union in_flow_tbl_u's val[6] in the
+- * vendor SDK for this APPE chip, see ppe_regs.h), not the wider 11-word
+- * capacity of PPE_IN_FLOW_TBL_OP_DATA -- that register block is sized
+- * for the largest entry type sharing this trigger mechanism (an IPv6
+- * 5-tuple entry needs more words for its wider addresses). Word 5 holds
+- * the top bits of the path MTU the hardware checks each packet against.
++/* Number of 32-bit words that make up one flow entry of each family.
++ * These are the entries' own sizes (the vendor SDK's union in_flow_tbl_u
++ * val[6] and union in_flow_ipv6_5tuple_tbl_u val[9] for this APPE chip,
++ * see ppe_regs.h), not the wider 11-word capacity of
++ * PPE_IN_FLOW_TBL_OP_DATA, which is sized for the largest entry type
++ * sharing this trigger mechanism. Word 5 of the IPv4 entry and word 3
++ * of the IPv6 one hold the top bits of the path MTU the hardware checks
++ * each packet against.
+  */
+-#define PPE_FLOW_TBL_ENTRY_WORDS		6
++#define PPE_FLOW_TBL_IPV4_ENTRY_WORDS		6
++#define PPE_FLOW_TBL_IPV6_ENTRY_WORDS		9
++#define PPE_FLOW_TBL_MAX_ENTRY_WORDS		PPE_FLOW_TBL_IPV6_ENTRY_WORDS
++
++/* The table is laid out in IPv4-sized slots (PPE_IN_FLOW_TBL_ENTRIES of
++ * them); an IPv6 entry is twice the size and takes two consecutive ones.
++ * The vendor SDK addresses the per-slot hit counters with the very index
++ * an IPv6 add returns, so the index is taken to be in slot units for
++ * both families (even for IPv6) -- an assumption the offload code checks
++ * on every IPv6 add, declining the flow if it does not hold.
++ */
++#define PPE_FLOW_TBL_IPV4_ENTRY_SLOTS		1
++#define PPE_FLOW_TBL_IPV6_ENTRY_SLOTS		2
+ 
+ /**
+  * enum ppe_flow_op_mode - PPE flow table addressing mode.
+@@ -36,7 +49,7 @@
+ 			 u64 *packets, u64 *bytes);
+ int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index);
+ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+-			const u32 entry[PPE_FLOW_TBL_ENTRY_WORDS], u32 *index);
++			const u32 *entry, unsigned int num_words, u32 *index);
+ int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
+ 
+ #endif
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c	2026-10-01 16:58:27.330008428 +0000
+@@ -6,7 +6,7 @@
+ /* IPv4 5-tuple flow entry field encoding, SNAT variant.
+  *
+  * This packs/unpacks struct ppe_flow_ipv4_nat_entry to/from the
+- * PPE_FLOW_TBL_ENTRY_WORDS-word format ppe_flow_entry_add()/whatever
++ * PPE_FLOW_TBL_IPV4_ENTRY_WORDS-word format ppe_flow_entry_add()/whatever
+  * read-back path is eventually built expects. Field layout is cross-word:
+  * PRI_PROFILE splits 1+4 bits across words 1/2, the 32-bit IP address
+  * splits 20+12 bits across words 2/3, and L4_DPORT splits 4+12 bits
+@@ -33,10 +33,10 @@
+ /**
+  * ppe_flow_ipv4_nat_entry_encode() - Pack an IPv4 SNAT or DNAT flow entry.
+  * @entry: The entry to pack.
+- * @words: Where to write the packed PPE_FLOW_TBL_ENTRY_WORDS words.
++ * @words: Where to write the packed PPE_FLOW_TBL_IPV4_ENTRY_WORDS words.
+  */
+ void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
+-				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS])
++				    u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS])
+ {
+ 	u32 ip = be32_to_cpu(entry->match_ip);
+ 
+@@ -73,15 +73,15 @@
+ 
+ /**
+  * ppe_flow_ipv4_nat_entry_decode() - Unpack an IPv4 SNAT or DNAT flow entry.
+- * @words: The packed PPE_FLOW_TBL_ENTRY_WORDS words to unpack.
++ * @words: The packed PPE_FLOW_TBL_IPV4_ENTRY_WORDS words to unpack.
+  * @entry: Where to store the unpacked entry.
+  *
+  * Recovers FWD_TYPE into entry->fwd_type, but does not validate it:
+  * callers are expected to only decode entries they know use one of the
+  * two NAT layouts (e.g. ones they wrote themselves).
+  */
+-void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
+-				      struct ppe_flow_ipv4_nat_entry *entry)
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS],
++				    struct ppe_flow_ipv4_nat_entry *entry)
+ {
+ 	u32 ip;
+ 
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h	2026-10-01 16:58:27.330008428 +0000
+@@ -25,10 +25,9 @@
+  * Hardware field width is 3 bits. The SNAT and DNAT overlays are
+  * bit-for-bit identical (the vendor's in_flow_tbl_0 and in_flow_tbl_3
+  * differ only in the names of the nexthop and L4 port fields), so one
+- * encoder serves both; the other forward types have different layouts
+- * (struct in_flow_tbl_0 in the vendor SDK) has been implemented so far
+- * -- DNAT/ROUTE/BRIDGE each reuse the same word 1 bit range for
+- * different fields and need their own entry struct/encode function.
++ * encoder serves both. ROUTE reuses the same word 1 bit range for its
++ * own fields (see ppe_flow_ipv6.h, whose entry is the one this driver
++ * routes with); FORWARD, BRIDGE, DROP and RDT_TO_CPU are not encoded.
+  */
+ enum ppe_flow_fwd_type {
+ 	PPE_FLOW_FWD_FORWARD = 0,
+@@ -104,8 +103,8 @@
+ };
+ 
+ void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
+-				      u32 words[PPE_FLOW_TBL_ENTRY_WORDS]);
+-void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_ENTRY_WORDS],
+-				      struct ppe_flow_ipv4_nat_entry *entry);
++				    u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS]);
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS],
++				    struct ppe_flow_ipv4_nat_entry *entry);
+ 
+ #endif
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.c b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.c	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.c	2026-10-01 16:58:27.330008428 +0000
+@@ -0,0 +1,142 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
++
++/* IPv6 5-tuple flow entry field encoding, ROUTE variant.
++ *
++ * Packs/unpacks struct ppe_flow_ipv6_route_entry to/from the
++ * PPE_FLOW_TBL_IPV6_ENTRY_WORDS-word format ppe_flow_entry_add() takes.
++ * Word 0 and the flag bits of word 1 are the IPv4 entry's; word 1's
++ * low bits carry the ROUTE overlay (nexthop + optional port override)
++ * instead of a NAT overlay's nexthop + port; then, the address being
++ * 128 bits wide, the VPN/PMTU fields follow the service code in word
++ * 2, the L4 ports sit in words 3/4 and the address spans words 4-8.
++ * All confirmed against the vendor SDK's packed bitfield structs
++ * (struct in_flow_ipv6_5tuple_tbl_2, APPE branch, include/hsl/hppe/
++ * hppe_flow_reg.h) and its assignment code (adpt_hppe_flow_entry_host_op_add()
++ * for FAL_FLOW_IP6_5TUPLE_ADDR, src/adpt/hppe/adpt_hppe_flow.c).
++ *
++ * The address is a single big-endian 128-bit integer to the hardware
++ * (the vendor's fal_ip6_addr_t ul[0] is the leading hextets, and its
++ * packing starts from ul[3]), packed least significant bits first
++ * across the split fields; ppe_flow_ipv6_addr_words() turns an
++ * in6_addr into that integer's little-end-first word array.
++ */
++
++#include <asm/byteorder.h>
++#include <linux/bitfield.h>
++#include <linux/in6.h>
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++#include "ppe_flow_ipv4.h"
++#include "ppe_flow_ipv6.h"
++#include "ppe_regs.h"
++
++/* w[0] is the least significant 32 bits of the address as an integer
++ * (its last four bytes), w[3] the most significant (its first four).
++ */
++static void ppe_flow_ipv6_addr_words(const struct in6_addr *addr, u32 w[4])
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		w[i] = be32_to_cpu(addr->s6_addr32[3 - i]);
++}
++
++static void ppe_flow_ipv6_addr_from_words(const u32 w[4], struct in6_addr *addr)
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		addr->s6_addr32[3 - i] = cpu_to_be32(w[i]);
++}
++
++/**
++ * ppe_flow_ipv6_route_entry_encode() - Pack an IPv6 ROUTE flow entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_FLOW_TBL_IPV6_ENTRY_WORDS words.
++ */
++void ppe_flow_ipv6_route_entry_encode(const struct ppe_flow_ipv6_route_entry *entry,
++				      u32 words[PPE_FLOW_TBL_IPV6_ENTRY_WORDS])
++{
++	u32 ip[4];
++
++	ppe_flow_ipv6_addr_words(&entry->match_ip, ip);
++
++	words[0] = entry->valid ? PPE_FLOW_TBL_VALID : 0;
++	words[0] |= PPE_FLOW_TBL_ENTRY_TYPE;	/* IPv6 */
++	words[0] |= entry->host_addr_is_dst ? PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_HOST_ADDR_INDEX, entry->host_addr_index);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_PROTOCOL_TYPE, entry->protocol);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_AGE, entry->age);
++	words[0] |= entry->src_l3_if_valid ? PPE_FLOW_TBL_SRC_L3_IF_VALID : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_SRC_L3_IF, entry->src_l3_if);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_FWD_TYPE, PPE_FLOW_FWD_ROUTE);
++
++	words[1] = FIELD_PREP(PPE_FLOW_TBL_ROUTE_NEXT_HOP, entry->route_nexthop);
++	/* PORT_VP_VALID clear: the nexthop's port is the egress. */
++	words[1] |= entry->deacclr_en ? PPE_FLOW_TBL_DE_ACCE : 0;
++	words[1] |= entry->copy_to_cpu ? PPE_FLOW_TBL_COPY_TO_CPU_EN : 0;
++	words[1] |= entry->syn_toggle ? PPE_FLOW_TBL_SYN_TOGGLE : 0;
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_0, entry->pri_profile & 0x1);
++
++	words[2] = FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_1, entry->pri_profile >> 1);
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_SERVICE_CODE, entry->service_code);
++	words[2] |= entry->pmtu_check_l3 ? PPE_FLOW_TBL_IPV6_PMTU_CHECK_TYPE : 0;
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_IPV6_PMTU_0, entry->pmtu);
++
++	words[3] = FIELD_PREP(PPE_FLOW_TBL_IPV6_PMTU_1, entry->pmtu >> 11);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_IPV6_L4_SPORT, entry->match_sport);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_IPV6_L4_DPORT_0, entry->match_dport);
++
++	words[4] = FIELD_PREP(PPE_FLOW_TBL_IPV6_L4_DPORT_1, entry->match_dport >> 4);
++	words[4] |= FIELD_PREP(PPE_FLOW_TBL_IPV6_IP_ADDR_0, ip[0]);
++	words[5] = ip[0] >> 20 | ip[1] << 12;
++	words[6] = ip[1] >> 20 | ip[2] << 12;
++	words[7] = ip[2] >> 20 | ip[3] << 12;
++	words[8] = FIELD_PREP(PPE_FLOW_TBL_IPV6_IP_ADDR_4, ip[3] >> 20);
++}
++
++/**
++ * ppe_flow_ipv6_route_entry_decode() - Unpack an IPv6 ROUTE flow entry.
++ * @words: The packed PPE_FLOW_TBL_IPV6_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ *
++ * Does not validate ENTRY_TYPE or FWD_TYPE: callers are expected to only
++ * decode entries they know use this layout (e.g. ones they wrote).
++ */
++void ppe_flow_ipv6_route_entry_decode(const u32 words[PPE_FLOW_TBL_IPV6_ENTRY_WORDS],
++				      struct ppe_flow_ipv6_route_entry *entry)
++{
++	u32 ip[4];
++
++	entry->valid = !!(words[0] & PPE_FLOW_TBL_VALID);
++	entry->host_addr_is_dst = !!(words[0] & PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE);
++	entry->host_addr_index = FIELD_GET(PPE_FLOW_TBL_HOST_ADDR_INDEX, words[0]);
++	entry->protocol = FIELD_GET(PPE_FLOW_TBL_PROTOCOL_TYPE, words[0]);
++	entry->age = FIELD_GET(PPE_FLOW_TBL_AGE, words[0]);
++	entry->src_l3_if_valid = !!(words[0] & PPE_FLOW_TBL_SRC_L3_IF_VALID);
++	entry->src_l3_if = FIELD_GET(PPE_FLOW_TBL_SRC_L3_IF, words[0]);
++
++	entry->route_nexthop = FIELD_GET(PPE_FLOW_TBL_ROUTE_NEXT_HOP, words[1]);
++	entry->deacclr_en = !!(words[1] & PPE_FLOW_TBL_DE_ACCE);
++	entry->copy_to_cpu = !!(words[1] & PPE_FLOW_TBL_COPY_TO_CPU_EN);
++	entry->syn_toggle = !!(words[1] & PPE_FLOW_TBL_SYN_TOGGLE);
++
++	entry->pri_profile = FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_0, words[1]) |
++			      (FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_1, words[2]) << 1);
++	entry->service_code = FIELD_GET(PPE_FLOW_TBL_SERVICE_CODE, words[2]);
++	entry->pmtu_check_l3 = !!(words[2] & PPE_FLOW_TBL_IPV6_PMTU_CHECK_TYPE);
++	entry->pmtu = FIELD_GET(PPE_FLOW_TBL_IPV6_PMTU_0, words[2]) |
++		      (FIELD_GET(PPE_FLOW_TBL_IPV6_PMTU_1, words[3]) << 11);
++
++	entry->match_sport = FIELD_GET(PPE_FLOW_TBL_IPV6_L4_SPORT, words[3]);
++	entry->match_dport = FIELD_GET(PPE_FLOW_TBL_IPV6_L4_DPORT_0, words[3]) |
++			      (FIELD_GET(PPE_FLOW_TBL_IPV6_L4_DPORT_1, words[4]) << 4);
++
++	ip[0] = FIELD_GET(PPE_FLOW_TBL_IPV6_IP_ADDR_0, words[4]) | words[5] << 20;
++	ip[1] = words[5] >> 12 | words[6] << 20;
++	ip[2] = words[6] >> 12 | words[7] << 20;
++	ip[3] = words[7] >> 12 | FIELD_GET(PPE_FLOW_TBL_IPV6_IP_ADDR_4, words[8]) << 20;
++	ppe_flow_ipv6_addr_from_words(ip, &entry->match_ip);
++}
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.h b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.h	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv6.h	2026-10-01 16:58:27.330008428 +0000
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_FLOW_IPV6_H__
++#define __PPE_FLOW_IPV6_H__
++
++#include <linux/in6.h>
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++#include "ppe_flow_ipv4.h"
++
++/**
++ * struct ppe_flow_ipv6_route_entry - IPv6 5-tuple flow entry, ROUTE variant.
++ * @valid: Whether this entry is active.
++ * @host_addr_is_dst: @host_addr_index refers to the destination address's
++ * host table entry when true, the source's when false. The endpoint this
++ * does *not* refer to is @match_ip below.
++ * @host_addr_index: Host table index (see ppe_host.h) of an IPv6 host
++ * entry, for the endpoint selected by @host_addr_is_dst.
++ * @protocol: Layer-4 protocol to match.
++ * @age: Hardware aging counter; write 0 on entry creation.
++ * @src_l3_if_valid: Whether @src_l3_if should be matched.
++ * @src_l3_if: Source L3 interface index to match, when @src_l3_if_valid.
++ * @route_nexthop: Nexthop table index (see ppe_nexthop.h) matched packets
++ * egress through, rewritten to its MAC and tags, with nothing above L2
++ * changed but the hop limit. The forward type is fixed at
++ * PPE_FLOW_FWD_ROUTE and the entry's port override is left unset, so the
++ * nexthop's port is the egress, as for the NAT entries.
++ * @deacclr_en: See struct ppe_flow_ipv4_nat_entry.
++ * @copy_to_cpu: Whether to also copy matched packets to the CPU path.
++ * @syn_toggle: Updated by hardware; not meaningful to set on creation.
++ * @pri_profile: QoS priority profile index for this flow.
++ * @service_code: Service code applied to matched packets.
++ * @match_ip: The 5-tuple match address for the endpoint not covered by
++ * @host_addr_index.
++ * @match_sport: Source port to match.
++ * @match_dport: Destination port to match.
++ * @pmtu: Path MTU matched packets are checked against before being
++ * forwarded; a packet exceeding it is redirected to the CPU. Must be
++ * set -- 0 would fail every packet.
++ * @pmtu_check_l3: Compare @pmtu against the L3 packet length (true) or
++ * the length including the L2 header (false).
++ */
++struct ppe_flow_ipv6_route_entry {
++	bool valid;
++	bool host_addr_is_dst;
++	u16 host_addr_index;
++	enum ppe_flow_protocol protocol;
++	u8 age;
++	bool src_l3_if_valid;
++	u8 src_l3_if;
++	u16 route_nexthop;
++	bool deacclr_en;
++	bool copy_to_cpu;
++	u8 syn_toggle;
++	u8 pri_profile;
++	u8 service_code;
++	struct in6_addr match_ip;
++	u16 match_sport;
++	u16 match_dport;
++	u16 pmtu;
++	bool pmtu_check_l3;
++};
++
++void ppe_flow_ipv6_route_entry_encode(const struct ppe_flow_ipv6_route_entry *entry,
++				      u32 words[PPE_FLOW_TBL_IPV6_ENTRY_WORDS]);
++void ppe_flow_ipv6_route_entry_decode(const u32 words[PPE_FLOW_TBL_IPV6_ENTRY_WORDS],
++				      struct ppe_flow_ipv6_route_entry *entry);
++
++#endif
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.c b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.c	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.c	2026-10-01 16:58:27.330008428 +0000
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
++
++/* IPv6 host table entry field encoding.
++ *
++ * As ppe_host_ipv4.c, with key_type selecting the plain-IPv6 variant
++ * (vendor adpt_hppe_ip_host_add(): key_type=2) and the 128-bit address
++ * packed as one big-endian integer, least significant bits first, from
++ * bit 22 of word 0 through words 1-3 into the low 22 bits of word 4 --
++ * the vendor SDK's struct host_ipv6_tbl and its assignment code, which
++ * starts the packing from fal_ip6_addr_t's ul[3] (the last hextets).
++ */
++
++#include <asm/byteorder.h>
++#include <linux/bitfield.h>
++#include <linux/in6.h>
++#include <linux/types.h>
++
++#include "ppe_host.h"
++#include "ppe_host_ipv6.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_host_ipv6_entry_encode() - Pack an IPv6 host table entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_HOST_TBL_IPV6_ENTRY_WORDS words.
++ */
++void ppe_host_ipv6_entry_encode(const struct ppe_host_ipv6_entry *entry,
++				u32 words[PPE_HOST_TBL_IPV6_ENTRY_WORDS])
++{
++	u32 ip[4];
++	int i;
++
++	/* ip[0] is the address's last four bytes as an integer, ip[3] its first. */
++	for (i = 0; i < 4; i++)
++		ip[i] = be32_to_cpu(entry->ip_addr.s6_addr32[3 - i]);
++
++	words[0] = entry->valid ? PPE_HOST_TBL_VALID : 0;
++	words[0] |= FIELD_PREP(PPE_HOST_TBL_KEY_TYPE, PPE_HOST_TBL_KEY_TYPE_IPV6);
++	words[0] |= entry->wan ? PPE_HOST_TBL_LAN_WAN : 0;
++	words[0] |= FIELD_PREP(PPE_HOST_TBL_IPV6_ADDR_0, ip[0]);
++	words[1] = ip[0] >> 10 | ip[1] << 22;
++	words[2] = ip[1] >> 10 | ip[2] << 22;
++	words[3] = ip[2] >> 10 | ip[3] << 22;
++	words[4] = FIELD_PREP(PPE_HOST_TBL_IPV6_ADDR_4, ip[3] >> 10);
++}
++
++/**
++ * ppe_host_ipv6_entry_decode() - Unpack an IPv6 host table entry.
++ * @words: The packed PPE_HOST_TBL_IPV6_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ */
++void ppe_host_ipv6_entry_decode(const u32 words[PPE_HOST_TBL_IPV6_ENTRY_WORDS],
++				struct ppe_host_ipv6_entry *entry)
++{
++	u32 ip[4];
++	int i;
++
++	entry->valid = !!(words[0] & PPE_HOST_TBL_VALID);
++	entry->wan = !!(words[0] & PPE_HOST_TBL_LAN_WAN);
++
++	ip[0] = FIELD_GET(PPE_HOST_TBL_IPV6_ADDR_0, words[0]) | words[1] << 10;
++	ip[1] = words[1] >> 22 | words[2] << 10;
++	ip[2] = words[2] >> 22 | words[3] << 10;
++	ip[3] = words[3] >> 22 | FIELD_GET(PPE_HOST_TBL_IPV6_ADDR_4, words[4]) << 10;
++
++	for (i = 0; i < 4; i++)
++		entry->ip_addr.s6_addr32[3 - i] = cpu_to_be32(ip[i]);
++}
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.h b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.h	1970-01-01 00:00:00.000000000 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv6.h	2026-10-01 16:58:27.330008428 +0000
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_IPV6_H__
++#define __PPE_HOST_IPV6_H__
++
++#include <linux/in6.h>
++#include <linux/types.h>
++
++#include "ppe_host.h"
++
++/**
++ * struct ppe_host_ipv6_entry - IPv6 host table entry.
++ * @valid: Whether this entry is active.
++ * @wan: True if @ip_addr is a WAN-side address, false if LAN-side.
++ * @ip_addr: The IPv6 address this entry represents.
++ */
++struct ppe_host_ipv6_entry {
++	bool valid;
++	bool wan;
++	struct in6_addr ip_addr;
++};
++
++void ppe_host_ipv6_entry_encode(const struct ppe_host_ipv6_entry *entry,
++				u32 words[PPE_HOST_TBL_IPV6_ENTRY_WORDS]);
++void ppe_host_ipv6_entry_decode(const u32 words[PPE_HOST_TBL_IPV6_ENTRY_WORDS],
++				struct ppe_host_ipv6_entry *entry);
++
++#endif
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-01 16:58:27.340008428 +0000
+@@ -12,17 +12,49 @@
+  * outside it, falling back to the kernel's normal software forwarding
+  * path:
+  *
+- * - IPv4 only.
++ * - IPv4 with NAT, or IPv6 without: see the next two items.
+  * - TCP, UDP or UDP-Lite only.
+- * - SNAT (source NAT / masquerade) direction only -- the reply/DNAT
+- *   direction of a NAT connection is a separate flow_cls_offload with
+- *   its own cookie and is declined here. A masqueraded connection is
+- *   therefore accelerated outbound but stays on the software path
+- *   inbound, which is a real, known limitation of this milestone, not
+- *   an oversight.
++ * - IPv6 flows are accepted only as plain routing -- no address or port
++ *   rewrite (NAT66/NPTv6 arrive as FLOW_ACT_MANGLE_HDR_TYPE_IP6 or L4
++ *   mangles and are declined), either direction, with the ROUTE
++ *   overlay of the IPv6 5-tuple entry: the nexthop supplies the MAC
++ *   rewrite and the egress, hardware decrements the hop limit as it
++ *   does the TTL (the ingress L3 interface's TTL_DEC_BYPASS is clear
++ *   and its IPv6 unicast routing is enabled by edma_port.c). An IPv6
++ *   entry is two slots of the flow table; its index and the counter it
++ *   is read at are taken to be in slot units (ppe_flow.h), which every
++ *   IPv6 add checks for (an odd index is reported once and the flow
++ *   declined). Each remote IPv6 peer of an accepted flow pins two
++ *   slots of the 768-slot host table for as long as it has flows, as
++ *   an IPv4 peer pins one; a full table only keeps later flows in
++ *   software. Fragments and IPv6 extension headers are punted from a
++ *   flow hit by parser exceptions programmed at init, see
++ *   ppe_offload_hdr_exception_init(); without them IPv6 is declined.
++ * - IPv4: single-ended NAT only: either the source address (and optionally
++ *   the source port) is rewritten and the destination is not -- SNAT,
++ *   the LAN->WAN direction of a masqueraded connection and the reply
++ *   direction of a port forward -- or the destination is rewritten and
++ *   the source is not -- DNAT, the WAN->LAN reply of a masquerade and
++ *   the inbound direction of a port forward. Each direction of a
++ *   connection is its own flow_cls_offload with its own cookie and is
++ *   accepted or declined on its own. A flow that rewrites both ends
++ *   (hairpin NAT) or neither (plain routing) is declined: the two NAT
++ *   overlays of the flow entry are the only ones implemented. A DNAT
++ *   flow is accepted only when the address it translates is this
++ *   router's own on the interface (or VLAN upper) the packets arrive
++ *   through: the rule carries no trace of an encapsulation the
++ *   flowtable cannot express, so a PPPoE WAN's reply would otherwise
++ *   be programmed as a plain-IPv4 entry that a spoofed frame on the
++ *   WAN segment could hit while software drops it.
++ *   The same check keeps a DNAT flow entering through a DSA user port
++ *   (a redirect from the LAN) in software, and likewise one entering a
++ *   WAN that is a bridge over the EDMA port: the address is the
++ *   bridge's, the rule's ingress is the port, and that is deliberate
++ *   for now.
+  * - Egress device must be one of this driver's own EDMA port
+- *   netdevices (edma_port_is_edma_netdev()). A tagged WAN (e.g. wan.10)
+- *   arrives as that plain EDMA device plus a FLOW_ACTION_VLAN_PUSH: the
++ *   netdevices (edma_port_is_edma_netdev()), or a DSA user port whose
++ *   conduit is one. A tagged WAN (e.g. wan.10) arrives as that plain
++ *   EDMA device plus a FLOW_ACTION_VLAN_PUSH: the
+  *   flowtable resolves the VLAN upper through dev_fill_forward_path()
+  *   and hands the tag over as the push, which the nexthop's C-VLAN
+  *   tag-insert fields carry (a redirect to the VLAN netdevice itself is
+@@ -30,17 +62,28 @@
+  *   The push must match a VLAN upper really stacked on that device,
+  *   whose MTU then bounds the flow's PMTU; a flow back out of its own
+  *   ingress port, a DSA conduit as egress, and a push with a PCP are
+- *   declined. A
+- *   second/S-tag push, or any other VLAN proto than 802.1Q, is
++ *   declined. A second/S-tag push, or any other VLAN proto than 802.1Q, is
+  *   declined -- untested, and this hardware's nexthop entry only has
+- *   a single C-VLAN + single S-VLAN insert field to begin with. Bridge
+- *   and DSA (rtl837x) netdevices themselves are still out of scope --
+- *   on this board's LAN side, real traffic's egress device is
+- *   typically a DSA/bridge netdevice, not an EDMA one (or a VLAN on
+- *   top of one), so this milestone in practice only accelerates the
+- *   WAN-side direction of traffic through a plain (or VLAN-tagged)
+- *   EDMA netdevice. Extending this to DSA/bridge devices (mirroring
+- *   mtk_flow_get_dsa_port()) is follow-up work.
++ *   a single C-VLAN + single S-VLAN insert field to begin with.
++ * - A DSA user port as egress (the LAN side of this board, mirroring
++ *   mtk_flow_get_dsa_port()) is programmed as the conduit's PPE port,
++ *   and the switch is told which port the frame is for through the
++ *   nexthop's tag inserts, since hardware cannot run the tagger:
++ *   see ppe_offload_dsa_egress(). The port is taken from the DSA
++ *   structures of the redirect target only; a port of a VLAN-aware
++ *   bridge, a port behind a LAG conduit, a VLAN push on top of a DSA
++ *   port, a tagger this code has no encapsulation for, and a conduit
++ *   whose parser is not programmed for that tagger are all declined.
++ *   Where the inserts name the port outright (rtl8_4), a client that
++ *   its own VLAN-unaware bridge later learns on another of its ports
++ *   has its flows re-pointed there, see ppe_offload_fdb_event().
++ * - Tagged ingress (the reply direction on a tagged WAN) arrives as a
++ *   FLOW_DISSECTOR_KEY_VLAN match on the real device plus a
++ *   FLOW_ACTION_VLAN_POP. The flow key cannot carry the VLAN, only the
++ *   port's ingress L3 interface, so this is accepted with the collapse
++ *   described under SECURITY LIMITATION below, and only when the VID
++ *   names a VLAN upper really stacked on that device. Tagged ingress on
++ *   a DSA user port (a VLAN-aware bridge) is declined.
+  * - The flow must carry a FLOW_ACTION_MANGLE for the Ethernet header:
+  *   this is the *only* source this code uses for the nexthop's
+  *   destination MAC, deliberately -- the kernel has already resolved
+@@ -64,21 +107,30 @@
+  *   accelerated, leaving conntrack holding closed connections at
+  *   timeouts[ESTABLISHED] instead of timeouts[CLOSE].
+  *
+- *   NOTE for whoever implements reply-direction offload: today a
+- *   remote peer's FIN/RST always traverses the software path anyway,
+- *   because the reply direction is declined, and that is what sets
+- *   NF_FLOW_CLOSING. The exceptions are therefore currently a second
+- *   line of defence for the LAN-initiated case (an RST abort draws no
+- *   reply). Once the reply direction IS offloaded they become the only
+- *   mechanism -- do not weaken them in that milestone.
+- *
+- *   Also for that milestone: while an rtl8_4 conduit aliases the parser
+- *   (edma_port.c), the global C-TPID is 0x0000. On the WAN port the
+- *   hardware then parses L3 four bytes after an EtherType of 0x0000 --
+- *   a frame Linux treats as 802.3 length and never as IP. Today that can
+- *   only end in a CPU punt; once WAN-ingress flows are offloaded, either
+- *   make the WAN port refuse such frames or verify the parser still
+- *   matches 0x8100 natively and revisit the TPID choice.
++ *   With both directions of a connection in hardware these exceptions
++ *   are the ONLY thing that returns a FIN or RST to software, in either
++ *   direction: nothing else sets NF_FLOW_CLOSING. Do not weaken them.
++ *
++ *   While an rtl8_4 conduit aliases the parser (edma_port.c), the
++ *   chip-wide ingress C-TPID is 0x0000. On the WAN port the hardware
++ *   then parses L3 four bytes after an EtherType of 0x0000 -- a frame
++ *   Linux treats as 802.3 length and never as IP -- and such a frame
++ *   can hit an offloaded WAN-ingress flow. That adds no exposure a
++ *   plain IP frame with the same 5-tuple does not already have: the
++ *   flow forwards either, and the nexthop's tag inserts replace
++ *   whatever was parsed (measured for the WAN egress, expected for the
++ *   conduit -- the same expectation covers a WAN frame carrying the
++ *   aliased 0x8899 S-TPID with an attacker-chosen TCI, which must not
++ *   survive into the emulated head tag -- measured so far: ten such
++ *   frames of each kind carrying a live flow's 5-tuple from the WAN,
++ *   the S+C kind naming lan2 in its mask, reached neither the flow's
++ *   client port nor lan1, and the flow they mimicked ran on; lan2 and
++ *   the CPU port were not watched, which a follow-up capture has to
++ *   cover before this counts as settled), so it is left alone. A real
++ *   0x8100 tag on the WAN is NOT parsed while the C-TPID is aliased
++ *   (measured: such flows sat in hardware and never hit), so a tagged
++ *   ingress is declined while the alias is active rather than
++ *   programmed for nothing.
+  *
+  * - SECURITY LIMITATION: a flow entry is keyed on the 5-tuple plus an
+  *   ingress L3 interface, and nothing finer. ppe_offload_ingress_edma_dev()
+@@ -90,45 +142,57 @@
+  *   host in the weaker zone can source-spoof a victim's offloaded
+  *   5-tuple and have silicon forward and translate its packets with no
+  *   software inspection -- no rp_filter, no interface-scoped rule. The
++ *   same holds for the VLANs of the WAN port once tagged ingress is
++ *   accepted: a flow entered through wan.10 also matches the 5-tuple
++ *   arriving untagged on wan, and vice versa. The
+  *   hardware offers no finer qualifier, so this is a property of
+  *   enabling the flowtable across such a boundary, not something this
+  *   driver can validate away.
+  *
+- * Hardware itself may also not consult the flow table at all yet for
+- * genuinely external ingress traffic -- ppe_servcode_init() bypasses
+- * flow lookup (PPE_SC_BYPASS_INGRESS_FLOW_LOOKUP) only for service
+- * code 1, which edma_tx.c applies solely to CPU-originated egress
+- * descriptors, not to arriving port traffic, so external ingress
+- * should default to an unbypassed (zeroed) bitmap and see flow lookup
+- * -- but this has not been confirmed against a live register read.
+- * That confirmation, along with everything else in this comment, is a
+- * hardware-testing-time question; nothing here changes it.
++ * Flow lookup on genuinely external ingress is a given by now: flows
++ * entering on the WAN port and on the conduit both hit in hardware
++ * (measured, both taggers).
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/bitfield.h>
++#include <linux/dsa/8021q.h>
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
++#include <linux/hashtable.h>
++#include <linux/if_bridge.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+ #include <linux/in.h>
++#include <linux/in6.h>
+ #include <linux/ip.h>
++#include <linux/inetdevice.h>
++#include <linux/jiffies.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/regmap.h>
+ #include <net/dsa.h>
++#include <net/ip6_fib.h>
++#include <net/ip6_route.h>
++#include <net/ipv6.h>
+ #include <linux/rhashtable.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/tcp.h>
++#include <linux/workqueue.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
++#include <net/switchdev.h>
+ 
+ #include "edma_port.h"
+ #include "ppe.h"
+ #include "ppe_flow.h"
+ #include "ppe_flow_ipv4.h"
++#include "ppe_flow_ipv6.h"
+ #include "ppe_host.h"
+ #include "ppe_host_ipv4.h"
++#include "ppe_host_ipv6.h"
+ #include "ppe_host_pool.h"
+ #include "ppe_nexthop.h"
+ #include "ppe_nexthop_pool.h"
+@@ -160,10 +224,42 @@
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+ 	u32 flow_index;
++	/* Slots of the flow table the entry takes from @flow_index on:
++	 * PPE_FLOW_TBL_IPV4_ENTRY_SLOTS or PPE_FLOW_TBL_IPV6_ENTRY_SLOTS.
++	 */
++	unsigned int flow_slots;
++	/* Which of @flow_ipv4 and @flow_ipv6 describes the entry. */
++	bool ipv6;
+ 	u32 host_index;
+ 	u32 nexthop_index;
+ 	u32 pub_ip_index;
+ 	bool flow_valid;
++	/* Only an SNAT flow holds a public IP table entry. */
++	bool pub_ip_valid;
++	/* Set when the nexthop's tag inserts name a DSA user port outright
++	 * (struct ppe_offload_egress::dsa_fixed) and that port is in a
++	 * VLAN-unaware bridge: the entry sits in
++	 * ppe_offload_priv::dsa_fixed_ht so that the bridge learning @dmac
++	 * on another of its ports on the same switch can re-point it, for
++	 * which the programmed nexthop and flow entry are kept. @dsa_ds is
++	 * only ever compared, never dereferenced.
++	 */
++	bool dsa_fixed;
++	/* A move for @dmac is queued and has not looked at this entry yet;
++	 * under dsa_fixed_lock.
++	 */
++	bool move_pending;
++	struct hlist_node dsa_fixed_hnode;
++	const struct dsa_switch *dsa_ds;
++	int dsa_ifindex;
++	int dsa_bridge_ifindex;
++	unsigned int dsa_index;
++	u8 dmac[ETH_ALEN];
++	struct ppe_nexthop_entry nexthop;
++	union {
++		struct ppe_flow_ipv4_nat_entry flow_ipv4;
++		struct ppe_flow_ipv6_route_entry flow_ipv6;
++	};
+ 	/* Hardware counters are cumulative and not clear-on-read, so keep the
+ 	 * previous reading and report the difference. lastused is refreshed only
+ 	 * when the packet count actually moves, which is what tells the flowtable
+@@ -173,6 +269,16 @@
+ 	u64 stats_packets;
+ 	u64 stats_bytes;
+ 	unsigned long lastused;
++	/* Packet count at the last refresh the flowtable sent for this
++	 * cookie, and whether one was seen at all (ppe_offload_flow_stale()).
++	 */
++	u64 refresh_packets;
++	bool refresh_seen;
++	/* Re-points within the current PPE_OFFLOAD_FDB_FLAP_WINDOW, see
++	 * ppe_offload_fdb_move_work().
++	 */
++	unsigned long move_window;
++	unsigned int move_count;
+ };
+ 
+ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+@@ -189,22 +295,40 @@
+  * @nexthop_pool: Refcounted nexthop table allocator.
+  * @pub_ip_pool: Refcounted public IP address table allocator.
+  * @flow_table: Offloaded flows, keyed by TC flow cookie.
+- * @flow_owner: One entry per hardware flow-table index, naming which
++ * @flow_owner: One entry per hardware flow-table slot, naming which
+  * (if any) &struct ppe_offload_flow_entry currently owns it in
+- * hardware. Only needed because of PPE_FLOW_OP_MODE_HASH's
+- * add-or-overwrite semantics -- see ppe_offload_flow_entry::flow_valid
+- * and ppe_offload_flow_replace()/_destroy() for how it's used to stop
+- * a superseded entry's later destroy from deleting a different, live
+- * flow's hardware entry.
++ * hardware; an IPv6 entry owns two consecutive slots. Only needed
++ * because of PPE_FLOW_OP_MODE_HASH's add-or-overwrite semantics -- see
++ * ppe_offload_flow_entry::flow_valid and ppe_offload_flow_own() and
++ * friends for how it's used to stop a superseded entry's later destroy
++ * from deleting a different, live flow's hardware entry.
+  * @tcp_exceptions_ok: Whether the TCP control-flag exceptions were programmed
+  * and read back correctly at init. TCP flows are only offloaded when they
+  * were: without them hardware would accelerate a FIN/RST teardown that the
+  * flowtable explicitly asked us not to -- see
+  * ppe_offload_tcp_exception_init().
++ * @hdr_exceptions_ok: Whether the fragment / extension-header exceptions
++ * were programmed and read back at init, see ppe_offload_hdr_exception_init().
++ * IPv6 flows are only offloaded when they were; IPv4 keeps its measured
++ * behaviour either way.
++ * @flow_full_last: jiffies of the last hash-mode add hardware refused for
++ * want of a free slot, 0 while none has been refused; under @lock. See
++ * ppe_offload_flow_tbl_full().
+  * @lock: Serializes the whole replace/destroy sequence -- looking up
+  * @flow_table, allocating from the pools, and programming hardware --
+  * against concurrent calls for different flows, mirroring
+  * mtk_ppe_offload.c's single mtk_flow_offload_mutex.
++ * @dsa_fixed_ht: Flows whose tag inserts name a DSA user port outright,
++ * hashed by destination MAC, see ppe_offload_fdb_event(). Modified under
++ * @lock and @dsa_fixed_lock together, read under either; an entry's port
++ * (dsa_ifindex) is updated under @lock with WRITE_ONCE() for the
++ * notifier's READ_ONCE() under @dsa_fixed_lock.
++ * @dsa_fixed_lock: Lets the atomic switchdev notifier look @dsa_fixed_ht up.
++ * @fdb_wq: Ordered workqueue the FDB-move follower runs on, so that a
++ * move's re-pointing is done by the time a later move is looked at.
++ * @fdb_nb: The switchdev notifier that feeds it.
++ * @fdb_moves: Move work items queued and not yet done, see
++ * PPE_OFFLOAD_FDB_MOVES_MAX.
+  */
+ struct ppe_offload_priv {
+ 	struct ppe_device *ppe_dev;
+@@ -214,7 +338,19 @@
+ 	struct rhashtable flow_table;
+ 	struct ppe_offload_flow_entry **flow_owner;
+ 	bool tcp_exceptions_ok;
++	bool hdr_exceptions_ok;
++	/* Whether a two-slot IPv6 entry was added at an even index, seen
++	 * valid there, and gone from both slots after its delete, at init
++	 * (ppe_offload_ipv6_selftest()). Without that IPv6 is declined.
++	 */
++	bool ipv6_table_ok;
++	unsigned long flow_full_last;
+ 	struct mutex lock;
++	DECLARE_HASHTABLE(dsa_fixed_ht, 9);
++	spinlock_t dsa_fixed_lock; /* see @dsa_fixed_ht */
++	struct workqueue_struct *fdb_wq;
++	struct notifier_block fdb_nb;
++	atomic_t fdb_moves;
+ };
+ 
+ static LIST_HEAD(ppe_offload_block_cb_list);
+@@ -265,8 +401,8 @@
+  * layout) and so can be covered by a single mangle at offset 0.
+  * Seeded from the original match ports, not zero: unlike the Ethernet
+  * header, only one of source/dest is ever actually being rewritten
+- * for the SNAT case this code supports, and the other must be
+- * preserved.
++ * for the single-ended NAT shapes this code supports, and the other
++ * must be preserved.
+  */
+ struct ppe_offload_l4_ports {
+ 	__be16 source;
+@@ -276,15 +412,23 @@
+ static int ppe_offload_apply_l4_mangle(struct ppe_offload_l4_ports *ports,
+ 					const struct flow_action_entry *act)
+ {
+-	u32 word;
++	__be16 word[2];
++	u32 w;
+ 
+ 	if (act->mangle.offset != 0)
+ 		return -EOPNOTSUPP;
+ 
+-	word = (__force u32)ports->source << 16 | (__force u32)ports->dest;
+-	word = (word & act->mangle.mask) | act->mangle.val;
+-	ports->source = (__force __be16)(word >> 16);
+-	ports->dest = (__force __be16)(word & 0xffff);
++	/* The mangle's mask and value describe the four header bytes as
++	 * they sit in the packet (source port, then destination port), so
++	 * combine them in that byte layout, not as a host-order integer.
++	 */
++	word[0] = ports->source;
++	word[1] = ports->dest;
++	memcpy(&w, word, sizeof(w));
++	w = (w & act->mangle.mask) | act->mangle.val;
++	memcpy(word, &w, sizeof(w));
++	ports->source = word[0];
++	ports->dest = word[1];
+ 
+ 	return 0;
+ }
+@@ -295,8 +439,8 @@
+  * compiles to nothing and leaves "offload silently does not happen"
+  * indistinguishable from "offload is not enabled" -- that cost a full
+  * hardware-test cycle to diagnose. But a ratelimited print is far too loud
+- * here: declining is the NORMAL case on this board (the reply direction of
+- * every NAT connection is declined, as is every IPv6 flow), and
++ * here: declining is the NORMAL case on this board (every IPv6 flow, every
++ * plain-routed or hairpin flow, every flow towards a Wi-Fi client), and
+  * flow_offload_refresh() retries an unoffloaded flow about once a second for
+  * as long as it lives. A handful of ordinary connections would sit at the
+  * ratelimit ceiling forever and push everything else out of the ring buffer.
+@@ -311,6 +455,237 @@
+ 			 ##__VA_ARGS__); \
+ 	   pr_debug("ppe_offload: declined - " fmt "\n", ##__VA_ARGS__); -EOPNOTSUPP; })
+ 
++/* Whether a rule carries its VLAN or CVLAN match key.
++ *
++ * The flowtable fills in the VLAN (and CVLAN) key of a tagged ingress
++ * but, unlike for every other key, does not set it in used_keys
++ * (nf_flow_rule_match(), v6.18), so flow_rule_match_key() alone says no
++ * and the pop action that comes with it would be declined as unmatched.
++ * The dissector's offset for the key is set together with the key and is
++ * never 0 for these two (meta comes first in struct nf_flow_key), so it
++ * serves as the second signal. Measured on a GL-BE9300 with wan.10: with
++ * flow_rule_match_key() alone every tagged-WAN reply was declined.
++ */
++static bool ppe_offload_rule_has_vlan_key(const struct flow_rule *rule,
++					  enum flow_dissector_key_id key)
++{
++	/* Only these two: the flowtable sets the offsets of the other keys
++	 * it knows unconditionally, so for them the offset says nothing.
++	 */
++	if (WARN_ON_ONCE(key != FLOW_DISSECTOR_KEY_VLAN && key != FLOW_DISSECTOR_KEY_CVLAN))
++		return false;
++
++	return flow_rule_match_key(rule, key) || rule->match.dissector->offset[key];
++}
++
++/**
++ * struct ppe_offload_egress - Where and how a flow leaves the PPE.
++ * @dev: The EDMA netdevice whose PPE port the nexthop names: the redirect
++ * target itself, the real device under a VLAN netdevice, or the conduit
++ * under a DSA user port.
++ * @stag: Insert an S-VLAN tag with @svid on egress.
++ * @svid: TCI of that tag (12-bit VID field; the insert has no PCP).
++ * @ctag: Insert a C-VLAN tag with @cvid on egress.
++ * @cvid: TCI of that tag.
++ * @dsa_index: Switch port index when the egress is a DSA user port.
++ * @bridge_ifindex: ifindex of the VLAN-unaware bridge that port is in, or 0.
++ * @dsa_ifindex: That user port's ifindex.
++ * @dsa_ds: That user port's switch, for identity comparison only.
++ * @dsa: Whether the egress is a DSA user port at all.
++ * @dsa_fixed: Whether the tag inserts name that port outright (rather than
++ * leaving the choice to the switch's own FDB), see ppe_offload_dsa_egress().
++ */
++struct ppe_offload_egress {
++	struct net_device *dev;
++	bool stag;
++	u16 svid;
++	bool ctag;
++	u16 cvid;
++	unsigned int dsa_index;
++	int dsa_ifindex;
++	const struct dsa_switch *dsa_ds;
++	int bridge_ifindex;
++	bool dsa;
++	bool dsa_fixed;
++};
++
++#if IS_ENABLED(CONFIG_NET_DSA)
++/* rtl8_4 head tag words as the nexthop's S-tag and C-tag inserts see them.
++ *
++ * The RTL8372N expects 0x8899 | 0x0400 | <flags> | <port mask> in front
++ * of the EtherType on CPU->switch frames (net/dsa/tag_rtl8_4.c). While the
++ * conduit's parser is aliased (edma_port.c) the chip-wide egress S-TPID is
++ * 0x8899 and the C-TPID 0x8100, so an S-tag insert with TCI 0x0400
++ * reproduces the first two words (protocol 0x04, reason 0: PCP and DEI of
++ * that TCI are the protocol byte's top bits, all zero) and a C-tag insert
++ * with TCI = BIT(port) reproduces the fourth (ALLOW=0, RX = forwarding
++ * port mask). The third word comes out as the egress C-TPID, 0x8100 --
++ * in the tag's flag layout EFID_EN=1 with EFID 0, PRI_EN=0 (so the PRI
++ * bits, 001, are ignored), KEEP=0, VSEL=0, LEARN_DIS=0. An explicit
++ * forwarding port mask does not consult the FDB, so the EFID does not
++ * matter to the egress decision; LEARN_DIS=0 lets the switch learn the
++ * conduit's MAC on its CPU port from these frames, which is where that
++ * address lives anyway. Both TCIs are written to the 12-bit VID fields
++ * with PCP and DEI zero; the egress stage must not remark a PCP into
++ * them (it would corrupt the protocol byte and set ALLOW) -- the nexthop
++ * entry has no PCP field, so this is a hardware property the bench has to
++ * confirm (a corrupted tag is a dropped frame, a visible failure), not
++ * something this code controls. Measured on a GL-BE9300: the switch
++ * accepts the pair as programmed here -- 2353 Mbit/s delivered to the
++ * port at 99.3% CPU idle from a cold boot on the default tagger -- once
++ * the conduit is an S-VLAN egress port (edma_port.c); left a C-VLAN
++ * port, the S-tag never comes out and the switch delivers nothing.
++ * Frames a LAN port forges with a 0x8899 head of its own arrive at the
++ * conduit as data inside the switch's genuine head tag (measured), so
++ * nothing a client sends can pose as this emulation either.
++ *
++ * Always the port outright, never the switch's own FDB: an untagged frame
++ * would be classified to the CPU port's PVID, which under this tagger is
++ * the seeded VLAN 1 that every port is a member of, so an FDB miss would
++ * flood a routed frame across every bridge on the switch.
++ */
++#define PPE_OFFLOAD_RTL8_4_STAG_TCI	0x0400
++/* Width of the tag's RX (forwarding port mask) field. */
++#define PPE_OFFLOAD_RTL8_4_RX_BITS	11
++
++/* Resolve a redirect to a DSA user port into the conduit's PPE port plus
++ * the tag inserts that make the switch deliver the frame to that port,
++ * mirroring mtk_flow_get_dsa_port() for the port lookup. Hardware cannot
++ * run the DSA tagger, so the switch has to be addressed with what the
++ * nexthop table can insert -- one C-tag and one S-tag -- which depends on
++ * the tagger in use and on the parser (and with it the chip-wide egress
++ * TPIDs) being programmed for that tagger on the conduit:
++ *
++ * - tag_8021q (vsc73xx-8021q): a C-tag with the port's tag_8021q VID.
++ *   For a port of a VLAN-unaware bridge that is the bridge VID, exactly
++ *   what the software tagger sends straight onto a bridged port: the
++ *   switch then picks the egress port from its own FDB, so a client that
++ *   moves ports is followed by the hardware flow as well (measured: the
++ *   download resumed in hardware after a re-cable), and a miss floods no
++ *   further than the bridge's members. An unbridged port gets its
++ *   standalone VID, whose only other member is the CPU port.
++ * - rtl8_4: the head tag emulated as S-tag + C-tag with the port's
++ *   forwarding mask (see PPE_OFFLOAD_RTL8_4_STAG_TCI).
++ *
++ * Only the DSA structures of the redirect target decide the port; the
++ * switch's FDB is never read. Declined: a port of a VLAN-aware bridge
++ * (its frames would need the bridge VLAN as a further tag, and the
++ * VLAN-unaware bridge VID trick does not apply), a conduit in a LAG, a
++ * VLAN push on top of the port, a tagger without an encapsulation here,
++ * and a conduit whose parser state does not match the tagger.
++ *
++ * Runs on the flowtable's offload workqueue, which holds neither RTNL
++ * nor RCU by itself (and must not take RTNL: the flowtable flushes this
++ * work while holding it on a netdevice going down). The redirect target
++ * is referenced by the rule for the duration of the call; the bridge is
++ * read as its RCU-protected master upper. The port's DSA bridge
++ * bookkeeping (read once, for the tag_8021q bridge number) is freed under
++ * RTNL without an RCU grace period, so a port leaving its bridge at this
++ * very moment is a residual race this shares with the DSA taggers' own
++ * xmit path and with mtk_flow_get_dsa_port().
++ *
++ * The encapsulation is tied to the parser state at this moment. It cannot
++ * go stale underneath a live flow: DSA changes the tagger only with the
++ * conduit and every user port down, and a user port going down tears
++ * down every flow through it (nf_flow_table_cleanup() keys on the flow's
++ * own ingress ports, one of which is that user port); the alias otherwise
++ * only leaves with the conduit closed, when the port forwards nothing.
++ *
++ * Return: 0 with @egress filled in, a negative error code to decline.
++ */
++static int ppe_offload_dsa_egress(struct net_device *odev, struct dsa_port *dp,
++				  bool vlan_push_seen, struct ppe_offload_egress *egress)
++{
++	const struct dsa_device_ops *tag_ops = dp->cpu_dp->tag_ops;
++	struct edma_port_priv *port_priv;
++	const struct dsa_bridge *b;
++	unsigned int bridge_num = 0;
++	struct net_device *bridge;
++	struct net_device *conduit;
++	bool vlan_aware = false;
++	u8 parser_state;
++
++	if (vlan_push_seen)
++		return ppe_offload_decline("odev=%s vlan push on a dsa port unsupported",
++					    netdev_name(odev));
++
++	if (dp->cpu_port_in_lag)
++		return ppe_offload_decline("odev=%s conduit is a lag", netdev_name(odev));
++
++	conduit = dp->cpu_dp->conduit;
++	if (!conduit || !edma_port_is_edma_netdev(conduit))
++		return ppe_offload_decline("odev=%s conduit is not an edma netdev",
++					    netdev_name(odev));
++
++	if (!tag_ops)
++		return ppe_offload_decline("odev=%s has no tagger", netdev_name(odev));
++
++	rcu_read_lock();
++	bridge = netdev_master_upper_dev_get_rcu(odev);
++	if (bridge && !netif_is_bridge_master(bridge))
++		bridge = NULL;
++	if (bridge) {
++		vlan_aware = br_vlan_enabled(bridge);
++		egress->bridge_ifindex = bridge->ifindex;
++		/* Read once: this is the DSA bookkeeping the residual race
++		 * in the function comment is about.
++		 */
++		b = READ_ONCE(dp->bridge);
++		bridge_num = b ? b->num : 0;
++	}
++	rcu_read_unlock();
++
++	if (vlan_aware)
++		return ppe_offload_decline("odev=%s is a port of a vlan-aware bridge",
++					    netdev_name(odev));
++
++	port_priv = netdev_priv(conduit);
++	parser_state = READ_ONCE(port_priv->parser_state);
++
++	switch (tag_ops->proto) {
++	case DSA_TAG_PROTO_VSC73XX_8021Q:
++		if (parser_state != EDMA_PARSER_DSA_8021Q)
++			return ppe_offload_decline("odev=%s conduit parser state %u, not tag_8021q",
++						    netdev_name(odev), parser_state);
++		egress->ctag = true;
++		if (bridge) {
++			/* The port left its bridge between the two reads. */
++			if (!bridge_num)
++				return ppe_offload_decline("odev=%s bridge membership changed",
++							    netdev_name(odev));
++			egress->cvid = dsa_tag_8021q_bridge_vid(bridge_num);
++		} else {
++			egress->cvid = dsa_tag_8021q_standalone_vid(dp);
++		}
++		break;
++	case DSA_TAG_PROTO_RTL8_4:
++		if (parser_state != EDMA_PARSER_DSA_RTL8_4)
++			return ppe_offload_decline("odev=%s conduit parser state %u, not rtl8_4",
++						    netdev_name(odev), parser_state);
++		if (dp->index >= PPE_OFFLOAD_RTL8_4_RX_BITS)
++			return ppe_offload_decline("odev=%s port %u outside the rtl8_4 port mask",
++						    netdev_name(odev), dp->index);
++		egress->stag = true;
++		egress->svid = PPE_OFFLOAD_RTL8_4_STAG_TCI;
++		egress->ctag = true;
++		egress->cvid = BIT(dp->index);
++		egress->dsa_fixed = true;
++		break;
++	default:
++		return ppe_offload_decline("odev=%s tagger %d unsupported", netdev_name(odev),
++					    tag_ops->proto);
++	}
++
++	egress->dev = conduit;
++	egress->dsa = true;
++	egress->dsa_index = dp->index;
++	egress->dsa_ifindex = odev->ifindex;
++	egress->dsa_ds = dp->ds;
++
++	return 0;
++}
++#endif
++
+ /* Resolve the device a flow's packets arrive on down to the EDMA port
+  * whose ingress L3 interface hardware will match against, mirroring
+  * the redirect-target resolution done for egress. A VLAN upper or a
+@@ -352,32 +727,261 @@
+ 	return dev;
+ }
+ 
++/* Whether the kernel's own route towards @addr leaves through @dev.
++ *
++ * The IPv6 counterpart of the IPv4 DNAT address check: the rule for the
++ * WAN->LAN direction carries no trace of a PPPoE encapsulation on the
++ * WAN (the flowtable resolves the session down to the Ethernet device
++ * and hands the ingress as that device), so a plain-framed entry would
++ * forward a frame that software, with the Ethernet device in no zone,
++ * drops. A peer that software reaches through the device the packets
++ * come in on is the only one such an entry is programmed for. Without
++ * IPv6 in the kernel there are no IPv6 flows to offer, and none are
++ * accepted. The lookup carries no source, mark or interface, so a
++ * peer reached only through a policy-routed table, or through the
++ * other member of an ECMP default route, is declined (fail closed).
++ */
++#if IS_ENABLED(CONFIG_IPV6)
++static bool ppe_offload_ipv6_reached_via(struct net *net, const struct in6_addr *addr,
++					 const struct net_device *dev)
++{
++	struct rt6_info *rt;
++	bool via;
++
++	rt = rt6_lookup(net, addr, NULL, 0, NULL, 0);
++	if (!rt)
++		return false;
++	via = rt->dst.dev == dev;
++	ip6_rt_put(rt);
++
++	return via;
++}
++#else
++static bool ppe_offload_ipv6_reached_via(struct net *net, const struct in6_addr *addr,
++					 const struct net_device *dev)
++{
++	return false;
++}
++#endif
++
++/* The slots of a partly overwritten entry that the new entry did not
++ * cover keep whatever words the old entry left there -- its head with
++ * the valid bit if the new entry took its tail, address bits that read
++ * as a head if it took the head -- and nothing would ever delete them:
++ * the old entry is superseded, and an index-mode delete at its head
++ * would take the new entry with it. Write them empty, one IPv4-sized
++ * slot at a time, and let go of them. Under priv->lock.
++ */
++static void ppe_offload_flow_clear_outside(struct ppe_offload_priv *priv,
++					   struct ppe_offload_flow_entry *old,
++					   u32 index, unsigned int slots)
++{
++	static const u32 empty[PPE_FLOW_TBL_IPV4_ENTRY_WORDS];
++	unsigned int i;
++
++	for (i = 0; i < old->flow_slots; i++) {
++		u32 slot = old->flow_index + i;
++
++		if (slot >= PPE_OFFLOAD_FLOW_TBL_ENTRIES)
++			break;
++		if (slot >= index && slot < index + slots)
++			continue;
++		if (ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_INDEX, empty,
++				       PPE_FLOW_TBL_IPV4_ENTRY_WORDS, &slot))
++			pr_warn("ppe_offload: slot %u of a partly overwritten flow entry not cleared\n",
++				slot);
++		if (priv->flow_owner[slot] == old)
++			priv->flow_owner[slot] = NULL;
++	}
++}
++
++/* flow_owner[] bookkeeping over the slot span of an entry, under priv->lock.
++ *
++ * HASH mode places an entry purely by hashing its match key, so an
++ * identical key (e.g. a same-5-tuple reconnect) always lands on the same
++ * index regardless of which flow got there first, and a two-slot IPv6
++ * entry could land over a slot an IPv4 entry holds (or the other way
++ * round; whether the hardware's allocator ever does that is not known,
++ * the vendor never handles it, so it is reported once when it does):
++ * whatever owned any slot of the span has just had its hardware entry
++ * silently overwritten. Mark it superseded so its own destroy, whenever
++ * it runs, doesn't delete what is now the new entry.
++ */
++static void ppe_offload_flow_supersede(struct ppe_offload_priv *priv, u32 index,
++				       unsigned int slots)
++{
++	unsigned int i;
++
++	for (i = 0; i < slots && index + i < PPE_OFFLOAD_FLOW_TBL_ENTRIES; i++) {
++		struct ppe_offload_flow_entry *old = priv->flow_owner[index + i];
++
++		if (!old)
++			continue;
++		if (old->flow_index < index || old->flow_index + old->flow_slots > index + slots) {
++			pr_warn_once("ppe_offload: flow entry %u+%u partly overwritten by %u+%u\n",
++				     old->flow_index, old->flow_slots, index, slots);
++			ppe_offload_flow_clear_outside(priv, old, index, slots);
++		} else {
++			pr_debug("ppe_offload: superseded flow_index=%u\n", index + i);
++		}
++		old->flow_valid = false;
++	}
++}
++
++static void ppe_offload_flow_own(struct ppe_offload_priv *priv,
++				 struct ppe_offload_flow_entry *entry)
++{
++	unsigned int i;
++
++	for (i = 0; i < entry->flow_slots && entry->flow_index + i < PPE_OFFLOAD_FLOW_TBL_ENTRIES;
++	     i++)
++		priv->flow_owner[entry->flow_index + i] = entry;
++}
++
++/* By pointer identity, unconditionally on flow_valid: if this entry's
++ * own add later failed after already superseding some earlier owner,
++ * flow_owner[] can still point at *this* entry even though flow_valid
++ * was never set true, and leaving it there would dangle once the entry
++ * is kfree()'d. If a later add for a different flow already overwrote a
++ * slot, flow_owner[] now points at that other, still-live entry instead
++ * -- the identity check leaves it alone.
++ */
++static void ppe_offload_flow_disown(struct ppe_offload_priv *priv,
++				    struct ppe_offload_flow_entry *entry)
++{
++	unsigned int i;
++
++	for (i = 0; i < entry->flow_slots && entry->flow_index + i < PPE_OFFLOAD_FLOW_TBL_ENTRIES;
++	     i++)
++		if (priv->flow_owner[entry->flow_index + i] == entry)
++			priv->flow_owner[entry->flow_index + i] = NULL;
++}
++
++/* A full table is an ordinary state on a busy router, not a fault, and the
++ * flowtable re-offers every flow left in software about once a second, so
++ * it is said once per episode: an episode ends after this long without
++ * another refusal.
++ */
++#define PPE_OFFLOAD_FLOW_FULL_QUIET	(60 * HZ)
++
++/* Whether a refused add was seen within the last PPE_OFFLOAD_FLOW_FULL_QUIET,
++ * i.e. a full-table episode is still running. Under priv->lock.
++ */
++static bool ppe_offload_flow_tbl_full_recent(const struct ppe_offload_priv *priv)
++{
++	return priv->flow_full_last &&
++	       time_before(jiffies, priv->flow_full_last + PPE_OFFLOAD_FLOW_FULL_QUIET);
++}
++
++/* Hardware refuses a hash-mode add (-ENOSPC) when every way of the key's
++ * bucket is taken. Report it with the table's occupancy, counted from the
++ * driver's own slot bookkeeping, so a full table can be told apart from a
++ * bucket that filled early. Under priv->lock.
++ */
++static void ppe_offload_flow_tbl_full(struct ppe_offload_priv *priv)
++{
++	bool new_episode = !ppe_offload_flow_tbl_full_recent(priv);
++	unsigned int i, used = 0;
++
++	priv->flow_full_last = jiffies ?: 1;
++	if (!new_episode)
++		return;
++
++	for (i = 0; i < PPE_OFFLOAD_FLOW_TBL_ENTRIES; i++)
++		if (priv->flow_owner[i])
++			used++;
++	pr_info("ppe_offload: flow table full: no free slot in the flow's hash bucket (%u of %u slots in use), flows hashing there stay in software\n",
++		used, PPE_IN_FLOW_TBL_ENTRIES);
++}
++
++static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask);
++static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
++				    struct ppe_offload_flow_entry *entry);
++
++/* Whether a flow the flowtable re-offers (flow_offload_refresh(), about
++ * once a second for as long as its packets cross the software path) has
++ * stopped matching in hardware. Called under priv->lock.
++ *
++ * A refresh for a cookie already in hardware means software is forwarding
++ * packets of this flow. That is normal while the other direction of the
++ * connection is declined, and the hardware counters of this direction keep
++ * moving then. When they have not moved since the previous refresh either,
++ * the entry no longer matches (measured on a GL-BE9300: after a burst of
++ * hop-limit-1 segments carrying a live IPv6 download's tuple, the download
++ * stayed in software for the rest of the connection, the entry's counter
++ * frozen, conntrack still marked offloaded). Answering -EEXIST forever
++ * keeps such a zombie; dropping it lets this very refresh program the flow
++ * afresh. An entry superseded in the table (flow_valid clear) is stale by
++ * definition. The first refresh only takes the baseline.
++ */
++static bool ppe_offload_flow_stale(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry)
++{
++	u64 packets, bytes;
++
++	if (!entry->flow_valid)
++		return true;
++
++	if (ppe_flow_counter_get(priv->ppe_dev, entry->flow_index, &packets, &bytes))
++		return false;
++
++	if (!entry->refresh_seen) {
++		entry->refresh_seen = true;
++		entry->refresh_packets = packets;
++		return false;
++	}
++
++	if (ppe_offload_counter_delta(packets, entry->refresh_packets,
++				      PPE_IN_FLOW_CNT_TBL_PKT_MAX)) {
++		entry->refresh_packets = packets;
++		return false;
++	}
++
++	return true;
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+ {
+ 	struct ppe_offload_l4_ports l4 = {};
+ 	struct ppe_offload_eth_mangle eth = {};
++	struct ppe_offload_egress egress = {};
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+ 	struct ppe_offload_flow_entry *entry;
+ 	struct ppe_host_ipv4_entry host_ipv4;
++	struct ppe_host_ipv6_entry host_ipv6;
+ 	struct ppe_flow_ipv4_nat_entry flow_ipv4;
++	struct ppe_flow_ipv6_route_entry flow_ipv6;
+ 	struct ppe_nexthop_entry nexthop;
+ 	struct edma_port_priv *port_priv;
+ 	struct net_device *odev = NULL;
+ 	struct net_device *idev;
+ 	struct flow_match_meta meta;
+ 	u32 ingress_l3_if = PPE_OFFLOAD_L3_IF_NONE;
+-	__be32 match_src, match_dst;
++	struct in6_addr match_src6, match_dst6;
++	__be32 match_src = 0, match_dst = 0;
+ 	__be32 new_src, new_dst;
+ 	__be16 match_sport, match_dport;
+-	u32 flow_words[PPE_FLOW_TBL_ENTRY_WORDS];
+-	u32 host_words[PPE_HOST_TBL_IPV4_ENTRY_WORDS];
+-	u32 host_index, nexthop_index, pub_ip_index, flow_index;
++	u32 flow_words[PPE_FLOW_TBL_MAX_ENTRY_WORDS];
++	u32 host_words[PPE_HOST_TBL_IPV6_ENTRY_WORDS];
++	unsigned int flow_num_words, flow_slots, host_num_words;
++	u32 host_index, nexthop_index, pub_ip_index = 0, flow_index;
+ 	const struct flow_action_entry *act;
+ 	bool vlan_push_seen = false;
++	bool ingress_vlan_bad = false;
++	bool dst_on_ingress = false;
++	bool src_via_ingress = false;
++	bool ingress_dsa = false;
++	bool ip6_mangled = false;
++	bool flow_full = false;
++	bool pub_ip = false;
++	bool ipv6 = false;
++	unsigned int vlan_pops = 0;
++	u16 ingress_vlan_vid = 0;
+ 	u16 vlan_push_vid = 0;
+ 	unsigned int pmtu;
++	bool snat = false;
+ 	u8 ip_proto;
+ 	int action;
+ 	const char *stage = NULL;
+@@ -385,25 +989,71 @@
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+-		return ppe_offload_decline("missing dissector key (control=%d basic=%d ipv4=%d ports=%d)",
++		return ppe_offload_decline("missing dissector key (control=%d basic=%d ports=%d)",
+ 					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL),
+ 					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC),
+-					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS),
+ 					    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS));
+ 
+ 	{
+ 		struct flow_match_control ctrl;
+ 		struct flow_match_basic basic;
+-		struct flow_match_ipv4_addrs ip4;
+ 		struct flow_match_ports ports;
+ 
+ 		flow_rule_match_control(rule, &ctrl);
+-		if (ctrl.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+-			return ppe_offload_decline("addr_type=%d not ipv4", ctrl.key->addr_type);
+-
+ 		flow_rule_match_basic(rule, &basic);
++
++		/* Fail closed on anything but the plain framing of the
++		 * family the addresses are in, independent of the address
++		 * checks: an encapsulation the rule does not spell out must
++		 * not reach the encoder as that family. Both addresses must
++		 * be exact (the flowtable's are; a hand-written tc rule's
++		 * need not be, and the entry can only match one address).
++		 */
++		switch (ctrl.key->addr_type) {
++		case FLOW_DISSECTOR_KEY_IPV4_ADDRS: {
++			struct flow_match_ipv4_addrs ip4;
++
++			if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS))
++				return ppe_offload_decline("ipv4 addr_type without an ipv4 key");
++			if (basic.mask->n_proto && basic.key->n_proto != htons(ETH_P_IP))
++				return ppe_offload_decline("n_proto=0x%04x not ipv4",
++							    ntohs(basic.key->n_proto));
++			flow_rule_match_ipv4_addrs(rule, &ip4);
++			if (ip4.mask->src != htonl(~0u) || ip4.mask->dst != htonl(~0u))
++				return ppe_offload_decline("ipv4 address mask not exact");
++			match_src = ip4.key->src;
++			match_dst = ip4.key->dst;
++			break;
++		}
++		case FLOW_DISSECTOR_KEY_IPV6_ADDRS: {
++			struct flow_match_ipv6_addrs ip6;
++
++			if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS))
++				return ppe_offload_decline("ipv6 addr_type without an ipv6 key");
++			if (basic.mask->n_proto && basic.key->n_proto != htons(ETH_P_IPV6))
++				return ppe_offload_decline("n_proto=0x%04x not ipv6",
++							    ntohs(basic.key->n_proto));
++			flow_rule_match_ipv6_addrs(rule, &ip6);
++			if (memchr_inv(&ip6.mask->src, 0xff, sizeof(ip6.mask->src)) ||
++			    memchr_inv(&ip6.mask->dst, 0xff, sizeof(ip6.mask->dst)))
++				return ppe_offload_decline("ipv6 address mask not exact");
++			match_src6 = ip6.key->src;
++			match_dst6 = ip6.key->dst;
++			/* Never forwarded by software (ip6_forward()), so never
++			 * offered by the flowtable; a hand-written rule with one
++			 * would make the route check below arbitrary.
++			 */
++			if ((ipv6_addr_type(&match_src6) | ipv6_addr_type(&match_dst6)) &
++			    (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_MULTICAST))
++				return ppe_offload_decline("ipv6 link-local or multicast address");
++			ipv6 = true;
++			break;
++		}
++		default:
++			return ppe_offload_decline("addr_type=%d unsupported", ctrl.key->addr_type);
++		}
++
+ 		switch (basic.key->ip_proto) {
+ 		case IPPROTO_TCP:
+ 			/* Fail closed. Keyed on the protocol, not on the presence of
+@@ -427,9 +1077,10 @@
+ 			return ppe_offload_decline("ip_proto=%d unsupported", basic.key->ip_proto);
+ 		}
+ 
+-		flow_rule_match_ipv4_addrs(rule, &ip4);
+-		match_src = ip4.key->src;
+-		match_dst = ip4.key->dst;
++		if (ipv6 && !priv->hdr_exceptions_ok)
++			return ppe_offload_decline("ipv6 offload disabled: no header exceptions");
++		if (ipv6 && !priv->ipv6_table_ok)
++			return ppe_offload_decline("ipv6 offload disabled: table self-test failed");
+ 
+ 		flow_rule_match_ports(rule, &ports);
+ 		match_sport = ports.key->src;
+@@ -488,17 +1139,90 @@
+ 		return ppe_offload_decline("ingress ifindex %d not an exact match",
+ 					    meta.key->ingress_ifindex);
+ 
++	/* A tagged ingress (the reply direction on a tagged WAN) is matched
++	 * on its VLAN by the flowtable; hardware can only match the port, so
++	 * this is accepted with the collapse noted in the file comment, and
++	 * only where the tag really belongs to the device (checked below).
++	 * A second tag has no counterpart in the parser's classification.
++	 */
++	if (ppe_offload_rule_has_vlan_key(rule, FLOW_DISSECTOR_KEY_CVLAN))
++		return ppe_offload_decline("double-tagged ingress unsupported");
++
++	if (ppe_offload_rule_has_vlan_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan vlan;
++
++		flow_rule_match_vlan(rule, &vlan);
++		if (vlan.mask->vlan_tpid && vlan.key->vlan_tpid != htons(ETH_P_8021Q))
++			return ppe_offload_decline("ingress vlan tpid=0x%04x unsupported",
++						    ntohs(vlan.key->vlan_tpid));
++		if (vlan.mask->vlan_id != VLAN_VID_MASK || !vlan.key->vlan_id)
++			return ppe_offload_decline("ingress vlan id %u/%#x not an exact match",
++						    vlan.key->vlan_id, vlan.mask->vlan_id);
++		if (vlan.mask->vlan_priority)
++			return ppe_offload_decline("ingress vlan priority match unsupported");
++		ingress_vlan_vid = vlan.key->vlan_id;
++	}
++
+ 	/* The device is only used to resolve the index it maps to, so
+ 	 * take it under RCU rather than holding a reference.
+ 	 */
+ 	rcu_read_lock();
+ 	idev = dev_get_by_index_rcu(dev_net(netdev), meta.key->ingress_ifindex);
++	if (idev) {
++		struct net_device *l3dev = idev;
++
++		if (ingress_vlan_vid) {
++			/* The tag must name a VLAN upper of the very device
++			 * the frames arrive on. A DSA user port is excluded:
++			 * its tags are a VLAN-aware bridge's, and the
++			 * collapse would then cross bridge VLANs, which
++			 * nobody has measured.
++			 */
++			l3dev = NULL;
++			if (!is_vlan_dev(idev) && edma_port_is_edma_netdev(idev))
++				l3dev = __vlan_find_dev_deep_rcu(idev, htons(ETH_P_8021Q),
++								 ingress_vlan_vid);
++			if (!l3dev) {
++				ingress_vlan_bad = true;
++				idev = NULL;
++			}
++		}
++
++		/* Whether the destination the packets are addressed to is
++		 * this router's own address on the interface they arrive
++		 * through. Used below to accept only such DNAT flows: the
++		 * rule carries no trace of an encapsulation the flowtable
++		 * cannot express (PPPoE), and a plain IPv4 frame on the
++		 * WAN segment addressed to a PPPoE session's address would
++		 * otherwise be translated and delivered where software would
++		 * drop it.
++		 */
++		if (l3dev && !ipv6)
++			dst_on_ingress = __ip_dev_find(dev_net(netdev), match_dst, false) == l3dev;
++		if (l3dev && ipv6)
++			src_via_ingress = ppe_offload_ipv6_reached_via(dev_net(netdev), &match_src6,
++								       l3dev);
++	}
+ 	if (idev)
+ 		idev = ppe_offload_ingress_edma_dev(idev);
+-	if (idev)
++	if (idev) {
+ 		ingress_l3_if = ((struct edma_port_priv *)netdev_priv(idev))->l3_if_index;
++		/* Frames from a DSA conduit come from the switch: the LAN. */
++		ingress_dsa = netdev_uses_dsa(idev);
++	}
+ 	rcu_read_unlock();
+ 
++	if (ingress_vlan_bad)
++		return ppe_offload_decline("ingress ifindex %d has no vlan %u upper",
++					    meta.key->ingress_ifindex, ingress_vlan_vid);
++
++	/* See edma_port_parser_alias_active(): the parser would not see
++	 * the tag, so the entry would never hit.
++	 */
++	if (ingress_vlan_vid && edma_port_parser_alias_active())
++		return ppe_offload_decline("tagged ingress ifindex %d unparsed under rtl8_4 alias",
++					    meta.key->ingress_ifindex);
++
+ 	if (ingress_l3_if == PPE_OFFLOAD_L3_IF_NONE)
+ 		return ppe_offload_decline("ingress ifindex %d not on an edma netdev",
+ 					    meta.key->ingress_ifindex);
+@@ -521,6 +1245,8 @@
+ 					return ret;
+ 				break;
+ 			case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
++				if (ipv6)
++					return ppe_offload_decline("ip4 mangle on an ipv6 flow");
+ 				if (act->mangle.offset == offsetof(struct iphdr, saddr))
+ 					new_src = ppe_offload_apply_ip4_mangle(new_src, act);
+ 				else if (act->mangle.offset == offsetof(struct iphdr, daddr))
+@@ -529,6 +1255,14 @@
+ 					return ppe_offload_decline("ip4 mangle offset=%u unsupported",
+ 								    act->mangle.offset);
+ 				break;
++			case FLOW_ACT_MANGLE_HDR_TYPE_IP6:
++				/* Checked, with the port rewrites, once the
++				 * whole action list has been seen.
++				 */
++				if (!ipv6)
++					return ppe_offload_decline("ip6 mangle on an ipv4 flow");
++				ip6_mangled = true;
++				break;
+ 			case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+ 			case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+ 				ret = ppe_offload_apply_l4_mangle(&l4, act);
+@@ -566,6 +1300,14 @@
+ 			vlan_push_seen = true;
+ 			vlan_push_vid = act->vlan.vid;
+ 			break;
++		case FLOW_ACTION_VLAN_POP:
++			/* The parser has already classified past the ingress
++			 * tag and routed egress rebuilds L2 from the nexthop, so
++			 * the pop itself is free; it only has to be the one the
++			 * VLAN match above accounts for.
++			 */
++			vlan_pops++;
++			break;
+ 		default:
+ 			return ppe_offload_decline("action id=%d unsupported", act->id);
+ 		}
+@@ -574,6 +1316,28 @@
+ 	if (!odev || !eth.seen)
+ 		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
+ 
++	/* IPv6 is routed as is: the entry has no rewrite to offer beyond
++	 * the nexthop's L2 and the hop limit, so any address or port
++	 * change (NAT66, NPTv6) is declined -- see the file comment. A
++	 * flow entering from anywhere but the switch is accepted only when
++	 * its source is one software reaches through that ingress, see
++	 * ppe_offload_ipv6_reached_via() (a WAN that is a bridge over the
++	 * EDMA port therefore stays in software, as for IPv4 DNAT).
++	 */
++	if (ipv6) {
++		if (ip6_mangled || l4.source != match_sport || l4.dest != match_dport)
++			return ppe_offload_decline("ipv6 rewrite unsupported (%pI6c:%u>%pI6c:%u)",
++						    &match_src6, ntohs(match_sport), &match_dst6,
++						    ntohs(match_dport));
++		if (!ingress_dsa && !src_via_ingress)
++			return ppe_offload_decline("ipv6 source %pI6c not reached via ingress %d",
++						    &match_src6, meta.key->ingress_ifindex);
++	}
++
++	if (vlan_pops != !!ingress_vlan_vid)
++		return ppe_offload_decline("%u vlan pops for %s ingress tag", vlan_pops,
++					    ingress_vlan_vid ? "one" : "no");
++
+ 	/* Hardware checks each packet's L3 length against the flow's
+ 	 * PMTU and redirects oversized ones to the CPU. Take it from the
+ 	 * redirect target itself (before any VLAN unwrap below), as the
+@@ -622,39 +1386,83 @@
+ 		odev = vlan_dev_real_dev(odev);
+ 	}
+ 
+-	if (!edma_port_is_edma_netdev(odev))
+-		return ppe_offload_decline("odev=%s not an edma netdev", netdev_name(odev));
++#if IS_ENABLED(CONFIG_NET_DSA)
++	{
++		/* The flowtable holds a reference on the redirect target for
++		 * as long as the rule lives, and the DSA port of a live user
++		 * netdevice is not going anywhere either.
++		 */
++		struct dsa_port *dp = dsa_port_from_netdev(odev);
++
++		if (!IS_ERR(dp)) {
++			ret = ppe_offload_dsa_egress(odev, dp, vlan_push_seen, &egress);
++			if (ret)
++				return ret;
++		}
++	}
++#endif
++
++	if (!egress.dsa) {
++		if (!edma_port_is_edma_netdev(odev))
++			return ppe_offload_decline("odev=%s not an edma netdev", netdev_name(odev));
++
++		/* A DSA conduit carries the switch's CPU tag, which a routed
++		 * hardware flow would not emit; the switch is addressed
++		 * through its user ports above, never through the conduit.
++		 */
++		if (netdev_uses_dsa(odev))
++			return ppe_offload_decline("odev=%s is a dsa conduit", netdev_name(odev));
+ 
+-	/* A DSA conduit carries the switch's CPU tag, which a routed
+-	 * hardware flow would not emit.
+-	 */
+-	if (netdev_uses_dsa(odev))
+-		return ppe_offload_decline("odev=%s is a dsa conduit", netdev_name(odev));
++		egress.dev = odev;
++		if (vlan_push_seen) {
++			egress.ctag = true;
++			egress.cvid = vlan_push_vid;
++		}
++	}
+ 
+-	/* SNAT only: source changed, destination didn't. Declines the
+-	 * DNAT/reply direction and anything that changes both or
+-	 * neither -- see the file comment.
+-	 */
+-	if (new_src == match_src || new_dst != match_dst)
+-		return ppe_offload_decline("not snat-outbound (src %pI4->%pI4, dst %pI4->%pI4)",
+-					    &match_src, &new_src, &match_dst, &new_dst);
++	/* Single-ended NAT only: exactly one address changes, and the L4
++	 * port on the other side stays. SNAT is the outbound direction of
++	 * a masquerade, DNAT its reply (and either direction of a port
++	 * forward, which is the same two shapes the other way round). Both
++	 * ends changing (hairpin NAT) or neither (plain routing) is declined
++	 * -- see the file comment. An IPv6 flow was settled as routed above.
++	 */
++	if (ipv6) {
++		snat = false;
++	} else if (new_src != match_src && new_dst == match_dst && l4.dest == match_dport) {
++		snat = true;
++	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
++		if (!dst_on_ingress)
++			return ppe_offload_decline("dnat of %pI4, not an address of ingress %d",
++						    &match_dst, meta.key->ingress_ifindex);
++		snat = false;
++	} else {
++		return ppe_offload_decline("not single-ended nat (%pI4:%u>%pI4:%u %pI4:%u>%pI4:%u)",
++					    &match_src, ntohs(match_sport), &new_src,
++					    ntohs(l4.source), &match_dst, ntohs(match_dport),
++					    &new_dst, ntohs(l4.dest));
++	}
+ 
+ 	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
+ 	 * must be this egress port's own MAC -- if it isn't, either
+ 	 * this isn't the flow we think it is or the port's L3_IF entry
+ 	 * (edma_port_l3_if_update()) is out of sync, and egressing
+ 	 * with the wrong source MAC either way is worse than declining.
++	 * Behind a DSA user port that is the conduit's MAC, which its
++	 * user ports and (by default) their bridge inherit.
+ 	 */
+-	if (!ether_addr_equal(eth.bytes + ETH_ALEN, odev->dev_addr))
+-		return ppe_offload_decline("eth mangle src %pM != odev mac %pM",
+-					    eth.bytes + ETH_ALEN, odev->dev_addr);
++	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr))
++		return ppe_offload_decline("eth mangle src %pM != egress %s mac %pM",
++					    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
++					    egress.dev->dev_addr);
+ 
+-	port_priv = netdev_priv(odev);
++	port_priv = netdev_priv(egress.dev);
+ 
+ 	/* The flow key only knows the ingress port's L3 interface, not the
+ 	 * VLAN a frame came in on, so a flow leaving the port it entered
+-	 * (say untagged wan in, wan.10 out) would also match frames from the
+-	 * other VLAN of that port.
++	 * (say untagged wan in, wan.10 out, or one LAN VLAN to another over
++	 * the conduit) would also match frames from the other VLAN of that
++	 * port.
+ 	 */
+ 	if (ingress_l3_if == port_priv->l3_if_index)
+ 		return ppe_offload_decline("odev=%s hairpin to its own ingress port",
+@@ -662,22 +1470,45 @@
+ 
+ 	mutex_lock(&priv->lock);
+ 
+-	if (rhashtable_lookup_fast(&priv->flow_table, &cls->cookie, ppe_offload_flow_ht_params)) {
+-		ret = -EEXIST;
+-		stage = "exists";
+-		goto unlock;
++	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie,
++				       ppe_offload_flow_ht_params);
++	if (entry) {
++		if (!ppe_offload_flow_stale(priv, entry)) {
++			ret = -EEXIST;
++			stage = "exists";
++			goto unlock;
++		}
++		/* While the table is full, many connections have only one
++		 * direction in hardware; the other crosses the software path
++		 * and refreshes the flow, and a direction that saw no packet
++		 * in between is re-armed here as a matter of course. Only a
++		 * re-arm outside such an episode is worth a line.
++		 */
++		if (ppe_offload_flow_tbl_full_recent(priv))
++			pr_debug("ppe_offload: flow entry %u re-armed while the table is full\n",
++				 entry->flow_index);
++		else
++			pr_info_ratelimited("ppe_offload: flow entry %u re-armed: no hardware hits across refreshes\n",
++					    entry->flow_index);
++		ppe_offload_flow_forget(priv, entry);
+ 	}
+ 
+-	/* Public IP entry for the translated (post-SNAT) source address. */
+-	ret = ppe_pub_ip_pool_get_and_ref(priv->ppe_dev, &priv->pub_ip_pool, new_src,
+-					   &pub_ip_index);
+-	if (ret) {
+-		stage = "pub_ip";
+-		goto unlock;
++	/* Public IP entry for the translated (post-SNAT) source address.
++	 * DNAT carries its new destination in the nexthop entry instead.
++	 */
++	if (snat) {
++		ret = ppe_pub_ip_pool_get_and_ref(priv->ppe_dev, &priv->pub_ip_pool,
++						  new_src, &pub_ip_index);
++		if (ret) {
++			stage = "pub_ip";
++			goto unlock;
++		}
++		pub_ip = true;
+ 	}
+ 
+-	/* Nexthop: egress port + resolved next-hop MAC + the public IP
+-	 * entry just obtained.
++	/* Nexthop: egress port + resolved next-hop MAC + the tag inserts
++	 * the egress needs + the public IP entry (SNAT) or the new
++	 * destination address (DNAT); a routed IPv6 flow needs neither.
+ 	 */
+ 	memset(&nexthop, 0, sizeof(nexthop));
+ 	nexthop.port_valid = true;
+@@ -689,12 +1520,15 @@
+ 	 */
+ 	nexthop.port = port_priv->ppe_port->port_id;
+ 	nexthop.post_l3_if = port_priv->l3_if_index;
+-	nexthop.pub_addr_index = pub_ip_index;
+ 	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
+-	if (vlan_push_seen) {
+-		nexthop.ctag_fmt = true;
+-		nexthop.cvid = vlan_push_vid;
+-	}
++	if (snat)
++		nexthop.pub_addr_index = pub_ip_index;
++	else if (!ipv6)
++		nexthop.dnat_ip = new_dst;
++	nexthop.stag_fmt = egress.stag;
++	nexthop.svid = egress.svid;
++	nexthop.ctag_fmt = egress.ctag;
++	nexthop.cvid = egress.cvid;
+ 
+ 	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
+ 					    &nexthop_index);
+@@ -703,59 +1537,117 @@
+ 		goto deref_pub_ip;
+ 	}
+ 
+-	/* Host entry for the original (pre-NAT) source address -- the
+-	 * LAN client, shared across every flow through it.
+-	 */
+-	memset(&host_ipv4, 0, sizeof(host_ipv4));
+-	host_ipv4.valid = true;
+-	host_ipv4.wan = false;
+-	host_ipv4.ip_addr = match_src;
+-	ppe_host_ipv4_entry_encode(&host_ipv4, host_words);
++	/* Host entry for the original (pre-NAT) source address, for both
++	 * shapes: the LAN client of an SNAT flow, the remote peer of a DNAT
++	 * flow (marked WAN). The destination goes into the flow entry
++	 * itself. Keying the DNAT flow the other way round -- the public
++	 * address as the host, the remote as the flow's address, which the
++	 * entry format allows -- programs an entry hardware never hits:
++	 * measured on a GL-BE9300, such flows showed as offloaded while
++	 * every packet still crossed the CPU. A remote peer's entry is
++	 * shared by all its connections and returned when the last one
++	 * goes; a host table with no room left fails the add and the flow
++	 * stays on the software path (see the log note at the end). The
++	 * WAN mark is per address: an address that is the source of both
++	 * shapes (a routed segment that port-forwards without masquerade)
++	 * takes whichever flow programmed it last. A routed IPv6 flow is
++	 * keyed the same way but its host entry is always marked LAN, as
++	 * the vendor driver marks every host entry: marked WAN, a ROUTE
++	 * flow's entry never hits and its packets reach the CPU with code
++	 * 163 (L3 no route, nexthop invalid) -- measured on a GL-BE9300,
++	 * WAN->LAN IPv6 at 74% idle marked WAN, 98.6% idle marked LAN. An
++	 * IPv6 host entry is two slots of the host table.
++	 */
++	if (ipv6) {
++		memset(&host_ipv6, 0, sizeof(host_ipv6));
++		host_ipv6.valid = true;
++		host_ipv6.wan = false;
++		host_ipv6.ip_addr = match_src6;
++		ppe_host_ipv6_entry_encode(&host_ipv6, host_words);
++		host_num_words = PPE_HOST_TBL_IPV6_ENTRY_WORDS;
++	} else {
++		memset(&host_ipv4, 0, sizeof(host_ipv4));
++		host_ipv4.valid = true;
++		host_ipv4.wan = !snat;
++		host_ipv4.ip_addr = match_src;
++		ppe_host_ipv4_entry_encode(&host_ipv4, host_words);
++		host_num_words = PPE_HOST_TBL_IPV4_ENTRY_WORDS;
++	}
+ 
+ 	ret = ppe_host_pool_get_and_ref(priv->ppe_dev, &priv->host_pool, PPE_FLOW_OP_MODE_HASH,
+-					 host_words, PPE_HOST_TBL_IPV4_ENTRY_WORDS, &host_index);
++					 host_words, host_num_words, &host_index);
+ 	if (ret) {
+ 		stage = "host";
+ 		goto deref_nexthop;
+ 	}
+ 
+-	memset(&flow_ipv4, 0, sizeof(flow_ipv4));
+-	flow_ipv4.valid = true;
+-	flow_ipv4.host_addr_is_dst = false;
+-	flow_ipv4.host_addr_index = host_index;
+-	flow_ipv4.protocol = ip_proto;
+-	flow_ipv4.fwd_type = PPE_FLOW_FWD_SNAT;
+-	flow_ipv4.nat_nexthop = nexthop_index;
+-	flow_ipv4.nat_l4_port = be16_to_cpu(l4.source);
+-	flow_ipv4.match_ip = match_dst;
+-	flow_ipv4.match_sport = be16_to_cpu(match_sport);
+-	flow_ipv4.match_dport = be16_to_cpu(match_dport);
+-	flow_ipv4.src_l3_if_valid = true;
+-	flow_ipv4.src_l3_if = ingress_l3_if;
+-	flow_ipv4.pmtu = pmtu;
+-	flow_ipv4.pmtu_check_l3 = true;
+-	ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
++	if (ipv6) {
++		memset(&flow_ipv6, 0, sizeof(flow_ipv6));
++		flow_ipv6.valid = true;
++		flow_ipv6.host_addr_is_dst = false;
++		flow_ipv6.host_addr_index = host_index;
++		flow_ipv6.protocol = ip_proto;
++		flow_ipv6.route_nexthop = nexthop_index;
++		flow_ipv6.match_ip = match_dst6;
++		flow_ipv6.match_sport = be16_to_cpu(match_sport);
++		flow_ipv6.match_dport = be16_to_cpu(match_dport);
++		flow_ipv6.src_l3_if_valid = true;
++		flow_ipv6.src_l3_if = ingress_l3_if;
++		flow_ipv6.pmtu = pmtu;
++		flow_ipv6.pmtu_check_l3 = true;
++		ppe_flow_ipv6_route_entry_encode(&flow_ipv6, flow_words);
++		flow_num_words = PPE_FLOW_TBL_IPV6_ENTRY_WORDS;
++		flow_slots = PPE_FLOW_TBL_IPV6_ENTRY_SLOTS;
++	} else {
++		memset(&flow_ipv4, 0, sizeof(flow_ipv4));
++		flow_ipv4.valid = true;
++		flow_ipv4.host_addr_is_dst = false;
++		flow_ipv4.host_addr_index = host_index;
++		flow_ipv4.protocol = ip_proto;
++		flow_ipv4.fwd_type = snat ? PPE_FLOW_FWD_SNAT : PPE_FLOW_FWD_DNAT;
++		flow_ipv4.nat_nexthop = nexthop_index;
++		flow_ipv4.nat_l4_port = be16_to_cpu(snat ? l4.source : l4.dest);
++		flow_ipv4.match_ip = match_dst;
++		flow_ipv4.match_sport = be16_to_cpu(match_sport);
++		flow_ipv4.match_dport = be16_to_cpu(match_dport);
++		flow_ipv4.src_l3_if_valid = true;
++		flow_ipv4.src_l3_if = ingress_l3_if;
++		flow_ipv4.pmtu = pmtu;
++		flow_ipv4.pmtu_check_l3 = true;
++		ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
++		flow_num_words = PPE_FLOW_TBL_IPV4_ENTRY_WORDS;
++		flow_slots = PPE_FLOW_TBL_IPV4_ENTRY_SLOTS;
++	}
+ 
+ 	flow_index = 0;
+-	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, &flow_index);
++	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words, flow_num_words,
++				 &flow_index);
+ 	if (ret) {
++		if (ret == -ENOSPC) {
++			ppe_offload_flow_tbl_full(priv);
++			flow_full = true;
++		}
+ 		stage = "flow";
+ 		goto deref_host;
+ 	}
+ 
+-	/* HASH mode places this entry purely by hashing its match key, so
+-	 * an identical key (e.g. a same-5-tuple reconnect) always lands on
+-	 * the same index regardless of which flow got there first -- if
+-	 * another tracked flow already owned this index, hardware has just
+-	 * silently overwritten its entry with ours. Mark it superseded so
+-	 * its own destroy, whenever it runs, doesn't delete what is now
+-	 * our hardware entry.
+-	 */
+-	if (priv->flow_owner[flow_index]) {
+-		pr_debug("ppe_offload: superseded flow_index=%u\n", flow_index);
+-		priv->flow_owner[flow_index]->flow_valid = false;
++	/* See ppe_flow.h: a two-slot entry is expected at an even slot. An
++	 * odd one means the index is in some other unit, and with it the
++	 * slot span tracked below, the counter the stats are read at and
++	 * the index the entry is deleted by: nothing here can be trusted,
++	 * so take the entry back out and keep IPv6 in software.
++	 */
++	if (ipv6 && (flow_index & 1)) {
++		pr_warn_once("ppe_offload: ipv6 flow landed at odd index %u: not in slot units, ipv6 stays in software\n",
++			     flow_index);
++		ppe_flow_entry_del(priv->ppe_dev, flow_index);
++		ret = -EOPNOTSUPP;
++		stage = "flow";
++		goto deref_host;
+ 	}
+ 
++	ppe_offload_flow_supersede(priv, flow_index, flow_slots);
++
+ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+ 	if (!entry) {
+ 		ret = -ENOMEM;
+@@ -765,9 +1657,12 @@
+ 
+ 	entry->cookie = cls->cookie;
+ 	entry->flow_index = flow_index;
++	entry->flow_slots = flow_slots;
++	entry->ipv6 = ipv6;
+ 	entry->host_index = host_index;
+ 	entry->nexthop_index = nexthop_index;
+ 	entry->pub_ip_index = pub_ip_index;
++	entry->pub_ip_valid = pub_ip;
+ 	entry->flow_valid = true;
+ 
+ 	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+@@ -777,13 +1672,39 @@
+ 	}
+ 
+ 	entry->lastused = jiffies;
+-	priv->flow_owner[flow_index] = entry;
++	ppe_offload_flow_own(priv, entry);
++
++	/* An unbridged port has no FDB to move the client with. */
++	if (egress.dsa_fixed && egress.bridge_ifindex) {
++		entry->dsa_fixed = true;
++		entry->dsa_ds = egress.dsa_ds;
++		entry->dsa_ifindex = egress.dsa_ifindex;
++		entry->dsa_bridge_ifindex = egress.bridge_ifindex;
++		entry->dsa_index = egress.dsa_index;
++		ether_addr_copy(entry->dmac, eth.bytes);
++		entry->nexthop = nexthop;
++		if (ipv6)
++			entry->flow_ipv6 = flow_ipv6;
++		else
++			entry->flow_ipv4 = flow_ipv4;
++		spin_lock_bh(&priv->dsa_fixed_lock);
++		hash_add(priv->dsa_fixed_ht, &entry->dsa_fixed_hnode,
++			 ether_addr_to_u64(entry->dmac));
++		spin_unlock_bh(&priv->dsa_fixed_lock);
++	}
+ 
+ 	mutex_unlock(&priv->lock);
+ 
+-	pr_debug("ppe_offload: accepted flow_index=%u host_index=%u nexthop_index=%u pub_ip_index=%u src=%pI4->%pI4 odev=%s\n",
+-		  flow_index, host_index, nexthop_index, pub_ip_index,
+-		  &match_src, &new_src, netdev_name(odev));
++	if (ipv6)
++		pr_debug("ppe_offload: accepted route6 flow_index=%u host_index=%u nexthop_index=%u %pI6c:%u->%pI6c:%u odev=%s egress=%s\n",
++			 flow_index, host_index, nexthop_index, &match_src6, ntohs(match_sport),
++			 &match_dst6, ntohs(match_dport), netdev_name(odev),
++			 netdev_name(egress.dev));
++	else
++		pr_debug("ppe_offload: accepted %s flow_index=%u host_index=%u nexthop_index=%u src=%pI4->%pI4 dst=%pI4->%pI4 odev=%s egress=%s\n",
++			 snat ? "snat" : "dnat", flow_index, host_index, nexthop_index,
++			 &match_src, &new_src, &match_dst, &new_dst, netdev_name(odev),
++			 netdev_name(egress.dev));
+ 
+ 	return 0;
+ 
+@@ -796,20 +1717,38 @@
+ deref_nexthop:
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
+ deref_pub_ip:
+-	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
++	if (pub_ip)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
+ unlock:
+ 	mutex_unlock(&priv->lock);
+ 
+ 	/* -EEXIST is not a failure: flow_offload_refresh() re-offers a
+ 	 * flow that is already in hardware once a second for as long as
+-	 * its packets keep crossing the software path -- which, with only
+-	 * the SNAT direction accelerated (see the file comment), is the
+-	 * reply direction of every accepted connection. mtk_ppe_offload
+-	 * returns the same -EEXIST for this; only a genuine programming
+-	 * failure is worth a line.
+-	 */
+-	if (stage && ret != -EEXIST)
+-		pr_info_ratelimited("ppe_offload: replace failed at %s: %d\n", stage, ret);
++	 * its packets keep crossing the software path -- the other
++	 * direction of a connection whose one direction was declined, or
++	 * a flow hardware stopped matching. mtk_ppe_offload returns the
++	 * same -EEXIST for this; only a genuine programming failure is
++	 * worth a line. A full flow table was already said, once per
++	 * episode, by ppe_offload_flow_tbl_full().
++	 */
++	if (stage && ret != -EEXIST && !flow_full) {
++		/* A host table bucket with no room for one more address fails
++		 * the add the same way a fault does. The remote peers of DNAT
++		 * flows can fill it in ordinary use, and the flowtable re-offers
++		 * such a flow about once a second for as long as it lives, so
++		 * that case is said once rather than at the ratelimit forever.
++		 */
++		if (ret == -EIO && !strcmp(stage, "host"))
++			pr_info_once("ppe_offload: host table add failed (full?), flows stay in software\n");
++		else if (ret == -EOPNOTSUPP)
++			/* Already said once by the check that raised it. */
++			pr_debug("ppe_offload: replace declined at %s\n", stage);
++		else if (ret == -ENOSPC)
++			pr_info_once("ppe_offload: %s table full, flows stay in software\n",
++				     stage);
++		else
++			pr_info_ratelimited("ppe_offload: replace failed at %s: %d\n", stage, ret);
++	}
+ 
+ 	return ret;
+ }
+@@ -827,28 +1766,23 @@
+ 	}
+ 
+ 	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++	if (entry->dsa_fixed) {
++		spin_lock_bh(&priv->dsa_fixed_lock);
++		hash_del(&entry->dsa_fixed_hnode);
++		spin_unlock_bh(&priv->dsa_fixed_lock);
++	}
+ 
+-	/* Clear flow_owner[] by pointer identity, unconditionally on
+-	 * flow_valid: if this entry's own add later failed after already
+-	 * superseding some earlier owner (see ppe_offload_flow_replace()),
+-	 * flow_owner[] can still point at *this* entry even though
+-	 * flow_valid was never set true, and leaving it there would dangle
+-	 * once this entry is kfree()'d below. Gating the clear on
+-	 * flow_valid instead of identity would miss exactly that case.
+-	 *
+-	 * If a later add for a different flow already overwrote this
+-	 * entry's hardware slot, flow_owner[] now points at that other,
+-	 * still-live entry instead -- the identity check leaves it alone,
+-	 * and flow_valid being false skips deleting hardware out from
+-	 * under it.
++	/* See ppe_offload_flow_disown(): a superseded entry (flow_valid
++	 * false) skips deleting hardware out from under the flow that
++	 * overwrote its slot.
+ 	 */
+-	if (priv->flow_owner[entry->flow_index] == entry)
+-		priv->flow_owner[entry->flow_index] = NULL;
++	ppe_offload_flow_disown(priv, entry);
+ 	if (entry->flow_valid)
+ 		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 
+ 	mutex_unlock(&priv->lock);
+ 
+@@ -857,6 +1791,398 @@
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++/* Following bridge FDB moves for flows that name a switch port outright.
++ *
++ * A flow towards an rtl8_4 user port carries the port in its emulated head
++ * tag (see ppe_offload_dsa_egress()), so hardware keeps delivering to the
++ * port the flow was resolved for even after the client has moved to another
++ * one. The software flowtable has the same blind spot -- its direct transmit
++ * path is bound to the port it resolved at creation -- and nothing lets a
++ * driver tear a flow down (the cookie is opaque). What the driver can do is
++ * follow the move: the bridge learns the client's new port from the first
++ * frame that reaches the CPU and reports it as SWITCHDEV_FDB_ADD_TO_DEVICE
++ * on the new port device, and every fixed-port flow for that MAC is then
++ * re-pointed at the new port, in place. That first frame is the limit of
++ * this: a moved client's own hardware-forwarded packets never reach the
++ * bridge, so the move is noticed when the client next ARPs, renews its
++ * lease or opens a connection (the switch driver reports no hardware
++ * learning to the bridge), and until then its inbound traffic stays on the
++ * old port, exactly as the software flowtable would leave it for good. A
++ * tag_8021q port needs none of this: its bridge VID leaves the choice to
++ * the switch's own FDB.
++ *
++ * Only a move within the flow's own VLAN-unaware bridge counts, learned
++ * without a VLAN: that is the one domain in which the bridge itself would
++ * send the client's traffic to the new port. Another bridge on the same
++ * switch learning the address (a guest port claiming a trusted client's
++ * MAC) must not pull the flow across, which it otherwise would, since the
++ * emulated head tag addresses the port outright with no FDB or VLAN check
++ * in the switch. Within the bridge the follower trusts learning exactly as
++ * far as the bridge does: a port spoofing a client's MAC diverts the
++ * client's new traffic in software and its established hardware flows
++ * here.
++ *
++ * The notifier chain is atomic, so the work is done from a workqueue, and
++ * only queued when the address has a fixed-port flow in that bridge that
++ * is not already waiting for a move (the bridge notifies every address it
++ * learns, at the rate a host cares to make up source MACs, and a host
++ * with two ports can flap one address between them as fast as it likes);
++ * a small cap on the items in flight bounds the rest. The queued item pins
++ * the port device.
++ *
++ * Measured on a GL-BE9300: a client re-cabled from lan3 to lan1 during a
++ * download was back at 2353 Mbit/s in hardware about 7 s later, 5 s of
++ * which were the link coming up, with both of its flows re-pointed.
++ */
++/* Move work items in flight at most; a learn arriving beyond that is
++ * dropped, and the next learn of the address re-arms it.
++ */
++#define PPE_OFFLOAD_FDB_MOVES_MAX	64
++/* A flow re-pointed more than PPE_OFFLOAD_FDB_FLAP_MAX times within
++ * PPE_OFFLOAD_FDB_FLAP_WINDOW is dropped from hardware instead.
++ */
++#define PPE_OFFLOAD_FDB_FLAP_MAX	3
++#define PPE_OFFLOAD_FDB_FLAP_WINDOW	(10 * HZ)
++
++struct ppe_offload_fdb_move {
++	struct work_struct work;
++	struct ppe_offload_priv *priv;
++	struct net_device *dev;
++	netdevice_tracker tracker;
++	u8 addr[ETH_ALEN];
++};
++
++/* Drop a tracked flow whose hardware entry is already gone: release its
++ * table entries and forget its cookie, so that a later refresh from the
++ * flowtable re-offers it as a new flow. Called under priv->lock.
++ */
++static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
++				    struct ppe_offload_flow_entry *entry)
++{
++	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++	if (entry->dsa_fixed) {
++		spin_lock_bh(&priv->dsa_fixed_lock);
++		hash_del(&entry->dsa_fixed_hnode);
++		spin_unlock_bh(&priv->dsa_fixed_lock);
++	}
++	ppe_offload_flow_disown(priv, entry);
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	kfree(entry);
++}
++
++/* Re-point one fixed-port flow at @dp. Called under priv->lock.
++ *
++ * The key of the flow entry is unchanged, so it belongs in the slot
++ * hardware hashed it to: the entry is deleted and written back at that
++ * same index (PPE_FLOW_OP_MODE_INDEX) with the new nexthop; an
++ * index-mode write to the hashed slot is found by lookups like the
++ * hash-mode add was (measured: re-pointed flows resumed in hardware). A
++ * packet arriving in between is punted to the CPU, nothing more. The
++ * counters are zeroed by the add, so the stats baseline restarts with
++ * them.
++ *
++ * Return: 0 on success, a negative error code on failure. If the
++ * hardware entry is gone by then, the tracked flow is dropped altogether
++ * (ppe_offload_flow_forget()) so that the flowtable's next refresh
++ * re-offers it as a new flow instead of getting -EEXIST for a zombie.
++ */
++static int ppe_offload_flow_repoint(struct ppe_offload_priv *priv,
++				    struct ppe_offload_flow_entry *entry,
++				    const struct dsa_port *dp, const struct net_device *dev)
++{
++	struct ppe_flow_ipv6_route_entry flow_ipv6;
++	struct ppe_flow_ipv4_nat_entry flow_ipv4;
++	struct ppe_nexthop_entry nexthop = entry->nexthop;
++	u32 flow_words[PPE_FLOW_TBL_MAX_ENTRY_WORDS];
++	u32 flow_index = entry->flow_index;
++	unsigned int num_words;
++	u32 nexthop_index;
++	int ret;
++
++	nexthop.cvid = BIT(dp->index);
++	ret = ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool,
++					   &nexthop, &nexthop_index);
++	if (ret)
++		return ret;
++
++	if (entry->ipv6) {
++		flow_ipv6 = entry->flow_ipv6;
++		flow_ipv6.route_nexthop = nexthop_index;
++		ppe_flow_ipv6_route_entry_encode(&flow_ipv6, flow_words);
++		num_words = PPE_FLOW_TBL_IPV6_ENTRY_WORDS;
++	} else {
++		flow_ipv4 = entry->flow_ipv4;
++		flow_ipv4.nat_nexthop = nexthop_index;
++		ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
++		num_words = PPE_FLOW_TBL_IPV4_ENTRY_WORDS;
++	}
++
++	ret = ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
++	if (ret)
++		goto deref_new;
++
++	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_INDEX, flow_words, num_words,
++				 &flow_index);
++	if (ret) {
++		/* The old entry is gone. Disown the slots so nothing deletes
++		 * whatever lands there next, and forget the flow.
++		 */
++		ppe_offload_flow_disown(priv, entry);
++		entry->flow_valid = false;
++		ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
++		ppe_offload_flow_forget(priv, entry);
++		return ret;
++	}
++
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	entry->nexthop_index = nexthop_index;
++	entry->nexthop = nexthop;
++	if (entry->ipv6)
++		entry->flow_ipv6 = flow_ipv6;
++	else
++		entry->flow_ipv4 = flow_ipv4;
++	/* The notifier reads this under dsa_fixed_lock only. */
++	WRITE_ONCE(entry->dsa_ifindex, dev->ifindex);
++	entry->dsa_index = dp->index;
++	entry->stats_packets = 0;
++	entry->refresh_seen = false;
++	entry->stats_bytes = 0;
++
++	return 0;
++
++deref_new:
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
++	return ret;
++}
++
++static void ppe_offload_fdb_move_work(struct work_struct *work)
++{
++	struct ppe_offload_fdb_move *move = container_of(work, struct ppe_offload_fdb_move, work);
++	struct ppe_offload_priv *priv = move->priv;
++	struct ppe_offload_flow_entry *entry;
++	unsigned int moved = 0, failed = 0, dropped = 0;
++	struct edma_port_priv *port_priv;
++	struct net_device *bridge;
++	struct net_device *conduit;
++	struct hlist_node *tmp;
++	struct dsa_port *dp;
++
++	/* DSA tears its ports down under RTNL, and the device reference
++	 * alone keeps only the netdevice, not its port, alive.
++	 */
++	rtnl_lock();
++
++	/* The port may have left DSA, or its bridge, while this was queued. */
++	dp = dsa_port_from_netdev(move->dev);
++	if (IS_ERR(dp) || dp->index >= PPE_OFFLOAD_RTL8_4_RX_BITS)
++		goto out;
++	bridge = dsa_port_bridge_dev_get(dp);
++	if (!bridge || br_vlan_enabled(bridge))
++		goto out;
++
++	/* The bridge learns on a port before it forwards to it; a port it
++	 * would not deliver to is no destination for hardware either.
++	 */
++	if (dp->stp_state != BR_STATE_FORWARDING)
++		goto out;
++
++	/* What ppe_offload_dsa_egress() required of the original port: the
++	 * new one must hang off the same aliased EDMA conduit, whose PPE
++	 * port the kept nexthop names.
++	 */
++	if (dp->cpu_port_in_lag)
++		goto out;
++	conduit = dp->cpu_dp->conduit;
++	if (!conduit || !edma_port_is_edma_netdev(conduit))
++		goto out;
++	port_priv = netdev_priv(conduit);
++	if (READ_ONCE(port_priv->parser_state) != EDMA_PARSER_DSA_RTL8_4)
++		goto out;
++
++	mutex_lock(&priv->lock);
++
++	/* @lock keeps the entries alive; a failed re-point drops its entry. */
++	hash_for_each_possible_safe(priv->dsa_fixed_ht, entry, tmp, dsa_fixed_hnode,
++				    ether_addr_to_u64(move->addr)) {
++		if (!entry->flow_valid || entry->dsa_ds != dp->ds ||
++		    entry->nexthop.port != port_priv->ppe_port->port_id ||
++		    entry->dsa_bridge_ifindex != bridge->ifindex ||
++		    entry->dsa_ifindex == move->dev->ifindex ||
++		    !ether_addr_equal(entry->dmac, move->addr))
++			continue;
++
++		/* Following the bridge is only as good as its learning. An
++		 * address that keeps moving (a loop, a station on two ports,
++		 * or any host on the bridge sending frames with that source)
++		 * would drag the flow, and each re-point rewrites the table
++		 * under RTNL. The software fast path never follows a move at
++		 * all, so past a few moves in a short window the flow goes
++		 * back to it: the entry is dropped, the flowtable's next
++		 * refresh re-offers it, and the port it resolves then is
++		 * whatever the bridge says at that moment.
++		 */
++		if (time_after(jiffies, entry->move_window + PPE_OFFLOAD_FDB_FLAP_WINDOW)) {
++			entry->move_window = jiffies;
++			entry->move_count = 0;
++		}
++		if (++entry->move_count > PPE_OFFLOAD_FDB_FLAP_MAX) {
++			ppe_offload_flow_forget(priv, entry);
++			dropped++;
++			continue;
++		}
++
++		if (ppe_offload_flow_repoint(priv, entry, dp, move->dev))
++			failed++;
++		else
++			moved++;
++	}
++
++	mutex_unlock(&priv->lock);
++
++	/* A MAC flapping between two ports (a loop, a misbehaving client)
++	 * would otherwise turn this into a log storm.
++	 */
++	if (moved || failed || dropped)
++		pr_info_ratelimited("ppe_offload: %pM moved to %s: %u flow(s) re-pointed, %u not re-pointed, %u dropped for flapping\n",
++				    move->addr, netdev_name(move->dev), moved, failed, dropped);
++
++out:
++	rtnl_unlock();
++	/* Whether or not the move was applied, let the next learn of this
++	 * address queue again.
++	 */
++	spin_lock_bh(&priv->dsa_fixed_lock);
++	hash_for_each_possible(priv->dsa_fixed_ht, entry, dsa_fixed_hnode,
++			       ether_addr_to_u64(move->addr)) {
++		if (ether_addr_equal(entry->dmac, move->addr))
++			entry->move_pending = false;
++	}
++	spin_unlock_bh(&priv->dsa_fixed_lock);
++	atomic_dec(&priv->fdb_moves);
++	netdev_put(move->dev, &move->tracker);
++	kfree(move);
++}
++
++static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
++{
++	struct ppe_offload_priv *priv = container_of(nb, struct ppe_offload_priv, fdb_nb);
++	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++	const struct switchdev_notifier_fdb_info *fdb_info = ptr;
++	struct ppe_offload_flow_entry *entry;
++	struct ppe_offload_fdb_move *move;
++	struct net_device *bridge;
++	bool wanted = false;
++
++	if (event != SWITCHDEV_FDB_ADD_TO_DEVICE)
++		return NOTIFY_DONE;
++
++	/* The bridge reports a local (its own) address against the bridge
++	 * device, only a DSA user port can be the new home of a client this
++	 * driver addresses by port, a VLAN-aware bridge's entries carry a
++	 * VID this cannot follow, and a locked entry (MAB) is the bridge
++	 * withholding forwarding, not granting it.
++	 */
++	if (fdb_info->is_local || fdb_info->vid || fdb_info->locked ||
++	    !dsa_user_dev_check(dev))
++		return NOTIFY_DONE;
++
++	/* The chain runs under RCU, which is what the upper lookup needs. */
++	bridge = netdev_master_upper_dev_get_rcu(dev);
++	if (!bridge || !netif_is_bridge_master(bridge))
++		return NOTIFY_DONE;
++
++	if (atomic_read(&priv->fdb_moves) >= PPE_OFFLOAD_FDB_MOVES_MAX)
++		return NOTIFY_DONE;
++
++	/* Only an address with a live fixed-port flow of this very bridge
++	 * on some other port, not already waiting for a move, is worth a
++	 * work item; everything is re-checked under RTNL there.
++	 */
++	spin_lock_bh(&priv->dsa_fixed_lock);
++	hash_for_each_possible(priv->dsa_fixed_ht, entry, dsa_fixed_hnode,
++			       ether_addr_to_u64(fdb_info->addr)) {
++		if (!ether_addr_equal(entry->dmac, fdb_info->addr) ||
++		    entry->dsa_bridge_ifindex != bridge->ifindex ||
++		    READ_ONCE(entry->dsa_ifindex) == dev->ifindex ||
++		    entry->move_pending)
++			continue;
++		entry->move_pending = true;
++		wanted = true;
++	}
++	spin_unlock_bh(&priv->dsa_fixed_lock);
++
++	if (!wanted)
++		return NOTIFY_DONE;
++
++	move = kzalloc(sizeof(*move), GFP_ATOMIC);
++	if (!move)
++		goto unmark;
++	atomic_inc(&priv->fdb_moves);
++
++	INIT_WORK(&move->work, ppe_offload_fdb_move_work);
++	move->priv = priv;
++	netdev_hold(dev, &move->tracker, GFP_ATOMIC);
++	move->dev = dev;
++	ether_addr_copy(move->addr, fdb_info->addr);
++	queue_work(priv->fdb_wq, &move->work);
++
++	return NOTIFY_DONE;
++
++unmark:
++	spin_lock_bh(&priv->dsa_fixed_lock);
++	hash_for_each_possible(priv->dsa_fixed_ht, entry, dsa_fixed_hnode,
++			       ether_addr_to_u64(fdb_info->addr)) {
++		if (ether_addr_equal(entry->dmac, fdb_info->addr))
++			entry->move_pending = false;
++	}
++	spin_unlock_bh(&priv->dsa_fixed_lock);
++
++	return NOTIFY_DONE;
++}
++
++static int ppe_offload_fdb_follow_init(struct ppe_offload_priv *priv)
++{
++	int ret;
++
++	priv->fdb_wq = alloc_ordered_workqueue("ppe_offload_fdb", 0);
++	if (!priv->fdb_wq)
++		return -ENOMEM;
++
++	priv->fdb_nb.notifier_call = ppe_offload_fdb_event;
++	ret = register_switchdev_notifier(&priv->fdb_nb);
++	if (ret) {
++		destroy_workqueue(priv->fdb_wq);
++		priv->fdb_wq = NULL;
++	}
++
++	return ret;
++}
++
++/* Stops new moves, then waits for the queued ones. */
++static void ppe_offload_fdb_follow_exit(struct ppe_offload_priv *priv)
++{
++	if (!priv->fdb_wq)
++		return;
++
++	unregister_switchdev_notifier(&priv->fdb_nb);
++	destroy_workqueue(priv->fdb_wq);
++	priv->fdb_wq = NULL;
++}
++#else
++static inline int ppe_offload_fdb_follow_init(struct ppe_offload_priv *priv)
++{
++	return 0;
++}
++
++static inline void ppe_offload_fdb_follow_exit(struct ppe_offload_priv *priv)
++{
++}
++#endif
++
+ /* Difference between two readings of a counter that is @mask wide.
+  *
+  * The counters are narrower than u64 (32-bit packets, 40-bit bytes) and wrap,
+@@ -1215,18 +2541,18 @@
+ 	return regmap_update_bits(ppe_dev->regmap, addr, mask, val);
+ }
+ 
+-/* Give a TCP-flag slot's exception its action: redirect the segment to the CPU
+- * and de-accelerate the flow, and enable the exception for packets that hit an
+- * L3 flow entry (without that, an accelerated flow would bypass it entirely).
++/* Give an exception code its action: redirect the packet to the CPU, with or
++ * without de-accelerating its flow, and enable the exception for packets that
++ * hit an L3 flow entry (without that, an accelerated flow would bypass it
++ * entirely).
+  *
+  * Scoping it to a flow *hit* is what keeps this change confined to traffic the
+  * driver already offloads -- a FIN on a connection nobody offloaded never
+  * raises the exception and takes the ordinary software path.
+  */
+-static int ppe_offload_tcp_exception_action(struct ppe_device *ppe_dev,
+-					     unsigned int slot)
++static int ppe_offload_l3_exception_action(struct ppe_device *ppe_dev,
++					   u32 index, bool de_acce)
+ {
+-	u32 index = PPE_L3_EXCEPTION_TCP_FLAGS_0 + slot;
+ 	int ret;
+ 
+ 	ret = regmap_update_bits(ppe_dev->regmap,
+@@ -1235,7 +2561,7 @@
+ 				  PPE_L3_EXCEPTION_CMD_CMD | PPE_L3_EXCEPTION_CMD_DE_ACCE,
+ 				  FIELD_PREP(PPE_L3_EXCEPTION_CMD_CMD,
+ 					      PPE_L3_EXCEPTION_REDIRECT_TO_CPU) |
+-				  PPE_L3_EXCEPTION_CMD_DE_ACCE);
++				  (de_acce ? PPE_L3_EXCEPTION_CMD_DE_ACCE : 0));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1268,6 +2594,78 @@
+ 				   PPE_L3_FLOW_HIT_MISS_EXP_CTRL_EXCEP_EN, 0);
+ }
+ 
++/* Read one exception code's action and flow-hit / flow-miss enables back and
++ * check them against what ppe_offload_l3_exception_action() wrote. Not to
++ * re-check the address arithmetic, but to catch silicon interpreting the
++ * register map differently from the vendor headers, which is silent: the
++ * whole parser window is writable, so a wrong-branch address would read back
++ * whatever was written to it and pass unless every field is checked.
++ *
++ * Return: 0 if all matched, -EIO on a mismatch (logged), another negative
++ * error code on a failed read.
++ */
++static int ppe_offload_l3_exception_verify(struct ppe_device *ppe_dev, u32 index,
++					   bool de_acce, const char *what)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read(ppe_dev->regmap,
++			  PPE_L3_EXCEPTION_CMD_ADDR + index * PPE_L3_EXCEPTION_CMD_INC, &val);
++	if (ret)
++		goto read_failed;
++
++	if (FIELD_GET(PPE_L3_EXCEPTION_CMD_CMD, val) != PPE_L3_EXCEPTION_REDIRECT_TO_CPU ||
++	    !!(val & PPE_L3_EXCEPTION_CMD_DE_ACCE) != de_acce) {
++		dev_err(ppe_dev->dev,
++			"%s exception %u action mismatch (%#x); would not punt the packet\n",
++			what, index, val);
++		return -EIO;
++	}
++
++	ret = regmap_read(ppe_dev->regmap,
++			  PPE_L3_EXP_L3_FLOW_CTRL_ADDR + index * PPE_L3_EXP_L3_FLOW_CTRL_INC,
++			  &val);
++	if (ret)
++		goto read_failed;
++
++	if (val & PPE_L3_EXP_L3_FLOW_CTRL_EXCEP_EN) {
++		dev_err(ppe_dev->dev, "%s exception %u: generic flow enable still set (%#x)\n",
++			what, index, val);
++		return -EIO;
++	}
++
++	ret = regmap_read(ppe_dev->regmap,
++			  PPE_L3_FLOW_HIT_EXP_CTRL_ADDR + index * PPE_L3_FLOW_HIT_EXP_CTRL_INC,
++			  &val);
++	if (ret)
++		goto read_failed;
++
++	if (!(val & PPE_L3_FLOW_HIT_EXP_CTRL_EXCEP_EN)) {
++		dev_err(ppe_dev->dev, "%s exception %u not armed on flow hit (%#x)\n",
++			what, index, val);
++		return -EIO;
++	}
++
++	ret = regmap_read(ppe_dev->regmap,
++			  PPE_L3_FLOW_HIT_MISS_EXP_CTRL_ADDR +
++			  index * PPE_L3_FLOW_HIT_MISS_EXP_CTRL_INC, &val);
++	if (ret)
++		goto read_failed;
++
++	if (val & PPE_L3_FLOW_HIT_MISS_EXP_CTRL_EXCEP_EN) {
++		dev_err(ppe_dev->dev, "%s exception %u still armed on flow miss (%#x)\n",
++			what, index, val);
++		return -EIO;
++	}
++
++	return 0;
++
++read_failed:
++	dev_err(ppe_dev->dev, "%s exception %u readback failed: %d\n", what, index, ret);
++	return ret;
++}
++
+ /**
+  * ppe_offload_tcp_exception_init() - Program the TCP control-flag exceptions.
+  * @ppe_dev: PPE device.
+@@ -1295,7 +2693,9 @@
+ 		ret = ppe_offload_tcp_exception_slot(ppe_dev, i,
+ 						      ppe_offload_tcp_exception_flags[i]);
+ 		if (!ret)
+-			ret = ppe_offload_tcp_exception_action(ppe_dev, i);
++			ret = ppe_offload_l3_exception_action(ppe_dev,
++							      PPE_L3_EXCEPTION_TCP_FLAGS_0 + i,
++							      true);
+ 		if (ret) {
+ 			dev_err(ppe_dev->dev,
+ 				"failed to program TCP exception slot %u: %d\n", i, ret);
+@@ -1344,64 +2744,171 @@
+ 			return false;
+ 		}
+ 
+-		ret = regmap_read(ppe_dev->regmap,
+-				   PPE_L3_EXCEPTION_CMD_ADDR +
+-				   index * PPE_L3_EXCEPTION_CMD_INC, &val);
++		ret = ppe_offload_l3_exception_verify(ppe_dev, index, true, "TCP");
+ 		if (ret)
+-			goto read_failed;
+-
+-		if (FIELD_GET(PPE_L3_EXCEPTION_CMD_CMD, val) != PPE_L3_EXCEPTION_REDIRECT_TO_CPU ||
+-		    !(val & PPE_L3_EXCEPTION_CMD_DE_ACCE)) {
+-			dev_err(ppe_dev->dev,
+-				"TCP exception %u action mismatch (%#x); would not punt the segment\n",
+-				index, val);
+ 			return false;
+-		}
++	}
+ 
+-		ret = regmap_read(ppe_dev->regmap,
+-				   PPE_L3_EXP_L3_FLOW_CTRL_ADDR +
+-				   index * PPE_L3_EXP_L3_FLOW_CTRL_INC, &val);
+-		if (ret)
+-			goto read_failed;
++	dev_dbg(ppe_dev->dev, "TCP control-flag exceptions programmed and verified\n");
++	return true;
+ 
+-		if (val & PPE_L3_EXP_L3_FLOW_CTRL_EXCEP_EN) {
+-			dev_err(ppe_dev->dev,
+-				"TCP exception %u: generic flow enable still set (%#x)\n",
+-				index, val);
+-			return false;
+-		}
++read_failed:
++	dev_err(ppe_dev->dev, "TCP exception readback failed: %d\n", ret);
++	return false;
++}
+ 
+-		ret = regmap_read(ppe_dev->regmap,
+-				   PPE_L3_FLOW_HIT_EXP_CTRL_ADDR +
+-				   index * PPE_L3_FLOW_HIT_EXP_CTRL_INC, &val);
+-		if (ret)
+-			goto read_failed;
++/* Exception codes for a packet the parser could not classify to an L4
++ * 5-tuple the way the software fast path does: the fast path sends any
++ * fragment, and any IPv6 packet whose next header is not TCP or UDP
++ * outright (nf_flow_table_ip.c), through the slow path -- full netfilter
++ * and reassembly. A flow entry matches on the 5-tuple the parser did
++ * find, so without these the first fragment of a datagram would be
++ * forwarded by hardware and the rest reassembled by nobody, and an
++ * extension header would ride an accelerated flow past whatever software
++ * has to say about it. Redirected without de-accelerating: the flow goes
++ * on, the odd packet takes the software path.
++ *
++ * IPv6 SMALL_HOP_LIMIT is included so that an expiring packet is answered
++ * by software (which the fast path does for hop_limit <= 1) whether or
++ * not the L3 interface's TTL check reaches the hop limit.
++ */
++static const u8 ppe_offload_hdr_exception_codes[] = {
++	PPE_L3_EXCEPTION_IPV4_FRAG,
++	PPE_L3_EXCEPTION_IPV6_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_BAD_PAYLOAD_LEN,
++	PPE_L3_EXCEPTION_IPV6_DATA_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_WITH_EXT_HDR,
++	PPE_L3_EXCEPTION_IPV6_SMALL_HOP_LIMIT,
++	PPE_L3_EXCEPTION_IPV6_FRAG,
++	PPE_L3_EXCEPTION_IPV6_WITH_MORE_EXT_HDR,
++	PPE_L3_EXCEPTION_IPV6_UNK_LAST_NEXT_HDR,
++	PPE_L3_EXCEPTION_IPV6_MOBILITY_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_MOBILITY_HDR_CROSS_BORDER,
++	PPE_L3_EXCEPTION_IPV6_AH_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_AH_HDR_CROSS_BORDER,
++	PPE_L3_EXCEPTION_IPV6_ESP_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_ESP_HDR_CROSS_BORDER,
++	PPE_L3_EXCEPTION_IPV6_OTHER_EXT_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV6_OTHER_EXT_HDR_CROSS_BORDER,
++};
+ 
+-		if (!(val & PPE_L3_FLOW_HIT_EXP_CTRL_EXCEP_EN)) {
+-			dev_err(ppe_dev->dev,
+-				"TCP exception %u not armed on flow hit (%#x)\n", index, val);
++/* Read word 0 of one flow table slot straight from the table. */
++static int ppe_offload_flow_slot_word0(struct ppe_device *ppe_dev, u32 slot, u32 *word0)
++{
++	return regmap_read(ppe_dev->regmap, PPE_IN_FLOW_TBL_ADDR + slot * PPE_IN_FLOW_TBL_INC,
++			   word0);
++}
++
++/**
++ * ppe_offload_ipv6_selftest() - Prove the two-slot IPv6 entry lifecycle on this hardware.
++ * @ppe_dev: PPE device.
++ *
++ * Return: true if IPv6 entries may be used, false otherwise.
++ *
++ * Everything the IPv6 path assumes about the table (see ppe_flow.h) is
++ * checked once with a probe entry, at init when the table is empty and
++ * nothing can match it: a hash-mode add of a nine-word entry must land at
++ * an even index, that slot must then read valid and the one after it
++ * must not read as a valid head, and after an index-mode delete both
++ * slots must read empty. The probe keys an unspecified address and zero
++ * ports against host and nexthop index 0, which no packet resolves to.
++ * Any other outcome leaves IPv6 on the software path (declined once
++ * per reason) rather than trusting slot arithmetic that hardware does
++ * not share.
++ */
++static bool ppe_offload_ipv6_selftest(struct ppe_device *ppe_dev)
++{
++	struct ppe_flow_ipv6_route_entry probe = {};
++	u32 words[PPE_FLOW_TBL_IPV6_ENTRY_WORDS];
++	u32 index, head, tail;
++	bool ok = false;
++	int ret;
++
++	probe.valid = true;
++	probe.protocol = PPE_FLOW_PROTO_TCP;
++	ppe_flow_ipv6_route_entry_encode(&probe, words);
++
++	ret = ppe_flow_entry_add(ppe_dev, PPE_FLOW_OP_MODE_HASH, words,
++				 PPE_FLOW_TBL_IPV6_ENTRY_WORDS, &index);
++	if (ret) {
++		pr_warn("ppe_offload: ipv6 self-test: probe add failed: %d\n", ret);
++		return false;
++	}
++
++	if (index & 1) {
++		pr_warn("ppe_offload: ipv6 self-test: probe landed at odd index %u\n", index);
++		goto del;
++	}
++
++	if (ppe_offload_flow_slot_word0(ppe_dev, index, &head) ||
++	    ppe_offload_flow_slot_word0(ppe_dev, index + 1, &tail)) {
++		pr_warn("ppe_offload: ipv6 self-test: slot read failed\n");
++		goto del;
++	}
++	if (!(head & PPE_FLOW_TBL_VALID) || (tail & PPE_FLOW_TBL_VALID)) {
++		pr_warn("ppe_offload: ipv6 self-test: after add slot %u word0 %08x, slot %u word0 %08x\n",
++			index, head, index + 1, tail);
++		goto del;
++	}
++	ok = true;
++
++del:
++	ret = ppe_flow_entry_del(ppe_dev, index);
++	if (ret) {
++		pr_warn("ppe_offload: ipv6 self-test: probe delete failed: %d\n", ret);
++		return false;
++	}
++	if (ppe_offload_flow_slot_word0(ppe_dev, index, &head) ||
++	    ppe_offload_flow_slot_word0(ppe_dev, index + 1, &tail))
++		return false;
++	if ((head & PPE_FLOW_TBL_VALID) || (tail & PPE_FLOW_TBL_VALID)) {
++		pr_warn("ppe_offload: ipv6 self-test: after delete slot %u word0 %08x, slot %u word0 %08x\n",
++			index, head, index + 1, tail);
++		return false;
++	}
++
++	if (ok)
++		pr_info("ppe_offload: ipv6 self-test passed at index %u\n", index);
++	return ok;
++}
++
++/**
++ * ppe_offload_hdr_exception_init() - Program the fragment / extension-header exceptions.
++ * @ppe_dev: PPE device.
++ *
++ * Return: true if they were programmed and read back, false otherwise.
++ *
++ * As with the TCP exceptions, failure is not fatal: IPv6 flows are then
++ * declined (the parser would forward what software inspects), IPv4 keeps
++ * the behaviour it had before these were programmed.
++ */
++static bool ppe_offload_hdr_exception_init(struct ppe_device *ppe_dev)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_hdr_exception_codes); i++) {
++		u32 index = ppe_offload_hdr_exception_codes[i];
++
++		if (index >= PPE_L3_EXCEPTION_ENTRIES)
++			return false;
++		ret = ppe_offload_l3_exception_action(ppe_dev, index, false);
++		if (ret) {
++			dev_err(ppe_dev->dev, "failed to program header exception %u: %d\n",
++				index, ret);
+ 			return false;
+ 		}
++	}
+ 
+-		ret = regmap_read(ppe_dev->regmap,
+-				   PPE_L3_FLOW_HIT_MISS_EXP_CTRL_ADDR +
+-				   index * PPE_L3_FLOW_HIT_MISS_EXP_CTRL_INC, &val);
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_hdr_exception_codes); i++) {
++		ret = ppe_offload_l3_exception_verify(ppe_dev, ppe_offload_hdr_exception_codes[i],
++						      false, "header");
+ 		if (ret)
+-			goto read_failed;
+-
+-		if (val & PPE_L3_FLOW_HIT_MISS_EXP_CTRL_EXCEP_EN) {
+-			dev_err(ppe_dev->dev,
+-				"TCP exception %u still armed on flow miss (%#x)\n", index, val);
+ 			return false;
+-		}
+ 	}
+ 
+-	dev_dbg(ppe_dev->dev, "TCP control-flag exceptions programmed and verified\n");
++	dev_dbg(ppe_dev->dev, "fragment and extension-header exceptions programmed and verified\n");
+ 	return true;
+-
+-read_failed:
+-	dev_err(ppe_dev->dev, "TCP exception readback failed: %d\n", ret);
+-	return false;
+ }
+ 
+ /**
+@@ -1434,8 +2941,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	hash_init(priv->dsa_fixed_ht);
++	spin_lock_init(&priv->dsa_fixed_lock);
++	atomic_set(&priv->fdb_moves, 0);
++	ret = ppe_offload_fdb_follow_init(priv);
++	if (ret) {
++		rhashtable_destroy(&priv->flow_table);
++		return ret;
++	}
++
+ 	ret = flow_indr_dev_register(ppe_offload_indr_setup_tc_cb, priv);
+ 	if (ret) {
++		ppe_offload_fdb_follow_exit(priv);
+ 		rhashtable_destroy(&priv->flow_table);
+ 		return ret;
+ 	}
+@@ -1467,6 +2984,8 @@
+ 		return;
+ 
+ 	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
++	priv->hdr_exceptions_ok = ppe_offload_hdr_exception_init(ppe_dev);
++	priv->ipv6_table_ok = ppe_offload_ipv6_selftest(ppe_dev);
+ }
+ 
+ /* Free one tracked flow during teardown, removing whatever it still owns in
+@@ -1478,13 +2997,15 @@
+ 	struct ppe_offload_flow_entry *entry = ptr;
+ 	struct ppe_offload_priv *priv = arg;
+ 
+-	if (priv->flow_owner[entry->flow_index] == entry)
+-		priv->flow_owner[entry->flow_index] = NULL;
++	if (entry->dsa_fixed)
++		hash_del(&entry->dsa_fixed_hnode);
++	ppe_offload_flow_disown(priv, entry);
+ 	if (entry->flow_valid)
+ 		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 	kfree(entry);
+ }
+ 
+@@ -1501,6 +3022,8 @@
+ 
+ 	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
+ 				  ppe_offload_indr_block_unbind);
++	/* No more moves once the flows below start going away. */
++	ppe_offload_fdb_follow_exit(priv);
+ 	/* Free the tracked flows AND tear down the hardware entries they own.
+ 	 * rhashtable_destroy() would leak every entry and leave hardware still
+ 	 * forwarding for them -- and the pools torn down just below would then
+diff -ruN a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h	2026-10-01 16:58:26.770008427 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h	2026-10-01 16:58:27.330008428 +0000
+@@ -1226,6 +1226,23 @@
+ #define PPE_HOST_TBL_DST_INFO			GENMASK(19, 6)
+ #define PPE_HOST_TBL_LAN_WAN			BIT(20)
+ 
++/* KEY_TYPE values: the plain unicast IPv4 and IPv6 entry variants
++ * (vendor adpt_hppe_ip_host_add(): 0 and 2; 1 and 3 are the multicast
++ * variants).
++ */
++#define PPE_HOST_TBL_KEY_TYPE_IPV4		0
++#define PPE_HOST_TBL_KEY_TYPE_IPV6		2
++
++/* An IPv6 host entry (PPE_HOST_TBL_IPV6_ENTRY_WORDS words) shares word 0's
++ * flags; its address, packed as one big-endian 128-bit integer least
++ * significant bits first, begins at bit 22 of word 0, runs through the
++ * whole of words 1-3 and ends in the low 22 bits of word 4 -- the vendor
++ * SDK's struct host_ipv6_tbl (hppe_ip_reg.h) and the IPv6 branch of
++ * adpt_hppe_ip_host_add().
++ */
++#define PPE_HOST_TBL_IPV6_ADDR_0		GENMASK(31, 22)
++#define PPE_HOST_TBL_IPV6_ADDR_4		GENMASK(21, 0)
++
+ /* Word 1 (IP_ADDR) is a single whole-word value, no bitfield mask. */
+ 
+ /* Nexthop table, unlike the flow and host tables above, is addressed
+@@ -1368,7 +1385,7 @@
+ #define PPE_PUB_IP_ADDR_TBL_ENTRIES		16
+ #define PPE_PUB_IP_ADDR_TBL_INC		0x4
+ 
+-/* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_ENTRY_WORDS
++/* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_IPV4_ENTRY_WORDS
+  * words, written through PPE_IN_FLOW_TBL_OP_DATA / read back through
+  * PPE_IN_FLOW_TBL_OP_RSLT -- see ppe_flow.h/.c). This is the
+  * SNAT-variant field layout (union in_flow_tbl_u's bf0 in the vendor
+@@ -1377,6 +1394,14 @@
+  */
+ 
+ /* Word 0. */
++/* The flow table itself, as hardware lays it out in the IPE L3 block:
++ * vendor IPE_L3_BASE_ADDR (0x200000) + IN_FLOW_TBL_ADDRESS (0x40000), one
++ * 0x20-byte slot per index; a two-slot IPv6 entry starts at an even index.
++ * Written through the table op only; read directly for the IPv6 self-test.
++ */
++#define PPE_IN_FLOW_TBL_ADDR			0x240000
++#define PPE_IN_FLOW_TBL_INC			0x20
++
+ #define PPE_FLOW_TBL_VALID			BIT(0)
+ #define PPE_FLOW_TBL_ENTRY_TYPE			BIT(1)
+ #define PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE	BIT(2)
+@@ -1414,6 +1439,45 @@
+ /* Word 5. */
+ #define PPE_FLOW_TBL_PMTU_1			GENMASK(2, 0)
+ 
++/* Word 1, ROUTE overlay (fwd_type PPE_FLOW_FWD_ROUTE) of both the IPv4 and
++ * the IPv6 entry: the vendor's struct in_flow_tbl_2 / in_flow_ipv6_5tuple_tbl_2
++ * and adpt_hppe_flow_entry_host_op_add()'s FAL_FLOW_ROUTE assignments. The
++ * egress comes from the nexthop unless PORT_VP_VALID names a port outright.
++ * The flags (DE_ACCE onwards) sit where the NAT overlays have them.
++ */
++#define PPE_FLOW_TBL_ROUTE_NEXT_HOP		GENMASK(11, 0)
++#define PPE_FLOW_TBL_ROUTE_PORT_VP_VALID	BIT(12)
++#define PPE_FLOW_TBL_ROUTE_PORT_VP		GENMASK(20, 13)
++
++/* Field layout of an IPv6 5-tuple flow entry (PPE_FLOW_TBL_IPV6_ENTRY_WORDS
++ * words). Word 0 and word 1 are the IPv4 entry's (with ENTRY_TYPE set);
++ * the 128-bit address takes the tail of the entry, so the service code is
++ * followed straight by the VPN/PMTU fields, the L4 ports move up to word
++ * 3 and the address starts in word 4 -- the vendor SDK's
++ * struct in_flow_ipv6_5tuple_tbl_0 (APPE branch of hppe_flow_reg.h) and
++ * its IPv6 assignment code in adpt_hppe_flow_entry_host_op_add(). The
++ * address is packed as one big-endian 128-bit integer, least significant
++ * bits first: IP_ADDR_0 holds its low 20 bits, IP_ADDR_1..3 the next three
++ * whole words, IP_ADDR_4 the top 12 (the first hextet's high bits).
++ */
++
++/* Word 2. */
++#define PPE_FLOW_TBL_IPV6_VPN_ID		GENMASK(19, 12)
++#define PPE_FLOW_TBL_IPV6_PMTU_CHECK_TYPE	BIT(20)
++#define PPE_FLOW_TBL_IPV6_PMTU_0		GENMASK(31, 21)
++
++/* Word 3. */
++#define PPE_FLOW_TBL_IPV6_PMTU_1		GENMASK(2, 0)
++#define PPE_FLOW_TBL_IPV6_L4_SPORT		GENMASK(27, 12)
++#define PPE_FLOW_TBL_IPV6_L4_DPORT_0		GENMASK(31, 28)
++
++/* Word 4. */
++#define PPE_FLOW_TBL_IPV6_L4_DPORT_1		GENMASK(11, 0)
++#define PPE_FLOW_TBL_IPV6_IP_ADDR_0		GENMASK(31, 12)
++
++/* Words 5-7 (IP_ADDR_1..3) are whole words. Word 8: */
++#define PPE_FLOW_TBL_IPV6_IP_ADDR_4		GENMASK(11, 0)
++
+ /* TCP-flag exception matchers, in the ingress parser block ("Ingress parse",
+  * 0x1e0000, in ppe_readable_ranges[]). Hardware compares each TCP segment's
+  * flags against eight independent value/mask slots; a hit raises its own
+@@ -1492,4 +1556,28 @@
+  */
+ #define PPE_L3_EXCEPTION_TCP_FLAGS_0		46
+ 
++/* Exception codes (vendor fal_sec.h FAL_SEC_EXP_*) raised by the parser
++ * for a packet it cannot classify to an L4 5-tuple the way software
++ * does: fragments of either family, and an IPv6 packet with extension
++ * headers or with one it could not walk. Programmed to redirect to the
++ * CPU on a flow hit, see ppe_offload_hdr_exception_init().
++ */
++#define PPE_L3_EXCEPTION_IPV4_FRAG			10
++#define PPE_L3_EXCEPTION_IPV6_HDR_INCOMPLETE		22
++#define PPE_L3_EXCEPTION_IPV6_BAD_PAYLOAD_LEN		23
++#define PPE_L3_EXCEPTION_IPV6_DATA_INCOMPLETE		24
++#define PPE_L3_EXCEPTION_IPV6_WITH_EXT_HDR		25
++#define PPE_L3_EXCEPTION_IPV6_SMALL_HOP_LIMIT		26
++#define PPE_L3_EXCEPTION_IPV6_FRAG			30
++#define PPE_L3_EXCEPTION_IPV6_WITH_MORE_EXT_HDR		32
++#define PPE_L3_EXCEPTION_IPV6_UNK_LAST_NEXT_HDR		33
++#define PPE_L3_EXCEPTION_IPV6_MOBILITY_HDR_INCOMPLETE	34
++#define PPE_L3_EXCEPTION_IPV6_MOBILITY_HDR_CROSS_BORDER	35
++#define PPE_L3_EXCEPTION_IPV6_AH_HDR_INCOMPLETE		36
++#define PPE_L3_EXCEPTION_IPV6_AH_HDR_CROSS_BORDER	37
++#define PPE_L3_EXCEPTION_IPV6_ESP_HDR_INCOMPLETE	38
++#define PPE_L3_EXCEPTION_IPV6_ESP_HDR_CROSS_BORDER	39
++#define PPE_L3_EXCEPTION_IPV6_OTHER_EXT_HDR_INCOMPLETE	40
++#define PPE_L3_EXCEPTION_IPV6_OTHER_EXT_HDR_CROSS_BORDER 41
++
+ #endif
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -5,4 +5,4 @@
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_host_ipv4.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o ppe_pub_ip.o ppe_pub_ip_pool.o ppe_offload.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_flow.o ppe_host.o ppe_nexthop.o ppe_flow_ipv4.o ppe_flow_ipv6.o ppe_host_ipv4.o ppe_host_ipv6.o ppe_l3_if.o ppe_host_pool.o ppe_nexthop_pool.o ppe_pub_ip.o ppe_pub_ip_pool.o ppe_offload.o
+ 
+ #EDMA
