@@ -1,0 +1,31 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: use bridge master for the IPv6 route check (prototype)
+
+On the BE800 (IPQ9574, direct netdev ports under a software bridge,
+no DSA), 0451's IPv6 source-route guard compares the FIB egress device
+against the physical ingress port: rt6_lookup() returns br-lan while
+the ingress device is lanN, so the check always fails and every IPv6
+flow is declined (once per reason, then silently). The hardware table
+stays empty; conntrack still shows [OFFLOAD] from the software
+flowtable, and every v6 packet keeps traversing the CPU.
+
+Compare against the ingress device's bridge master for the IPv6
+check only, leaving the IPv4 DNAT semantics untouched. Prototype for
+perceival/openwrt-flint3#98 - DSA setups keep their behaviour since a
+DSA user port's master chain also ends at the bridge.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-01 22:26:52.730008660 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-01 22:26:52.740008660 +0000
+@@ -1200,8 +1200,9 @@
+ 		if (l3dev && !ipv6)
+ 			dst_on_ingress = __ip_dev_find(dev_net(netdev), match_dst, false) == l3dev;
+ 		if (l3dev && ipv6)
++			/* The FIB speaks of the bridge, not of its member port. */
+ 			src_via_ingress = ppe_offload_ipv6_reached_via(dev_net(netdev), &match_src6,
+-								       l3dev);
++					netdev_master_upper_dev_get_rcu(idev) ? : l3dev);
+ 	}
+ 	if (idev)
+ 		idev = ppe_offload_ingress_edma_dev(idev);
