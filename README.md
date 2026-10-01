@@ -24,7 +24,7 @@ The BE800 is not in OpenWrt main yet. This tree rides on top of
 and waits on a chain of open PRs:
 
 - Device support: [openwrt/openwrt#20373](https://github.com/openwrt/openwrt/pull/20373)
-- Wi-Fi board data (BDF): [openwrt/firmware_qca-wireless#159](https://github.com/openwrt/firmware_qca-wireless/pull/159)
+- Wi-Fi board data (BDF): ~~#159~~ **merged upstream** (firmware_qca-wireless @ 9a202b023de2)
 - First-boot network fix: [sidhantgoel/openwrt#6](https://github.com/sidhantgoel/openwrt/pull/6)
 
 As PRs merge, this branch rebases and the local deltas shrink.

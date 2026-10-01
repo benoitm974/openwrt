@@ -9,9 +9,10 @@ PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
 # Single source for both the firmware-2.bin override and the BDF
-# (board-tplink_archer-be800.qcn9274). Switch to
-# openwrt/firmware_qca-wireless once both files are merged there
-# (BDF: PR 159; AMSS override: not yet submitted).
+# (board-tplink_archer-be800.qcn9274). The BDF is now upstream
+# (firmware_qca-wireless, merged PR 159, commit 9a202b023de2); switch
+# PKG_SOURCE to the official repo once the AMSS override is submitted
+# and merged there too.
 PKG_SOURCE_URL:=https://github.com/sidhantgoel/firmware_qca-wireless.git
 PKG_SOURCE_DATE:=2026-03-03
 PKG_SOURCE_VERSION:=c7b7a979b30e9fbaf2c41b4ad96a4c4d67846927
