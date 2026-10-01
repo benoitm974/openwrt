@@ -68,19 +68,19 @@ jobs:
       - name: Collect artifacts
         run: |
           cd bin/targets/qualcommbe/ipq95xx/
-          mkdir -p /work/out
+          mkdir -p "$RUNNER_TEMP/out"
           cp *be800-combo-ubifs-sysupgrade.bin \
              *be800-combo-ubifs-factory.ubi \
              *be800-combo-ubifs-web-ui-factory.bin \
              *be800-combo.manifest \
-             sha256sums version.buildinfo /work/out/ || true
-          ls -la /work/out
+             sha256sums version.buildinfo "$RUNNER_TEMP/out/" || true
+          ls -la "$RUNNER_TEMP/out"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: be800-images
-          path: /work/out/*
+          path: ${{ runner.temp }}/out/*
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -93,4 +93,4 @@ jobs:
           - *-ubifs-web-ui-factory.bin — flash from the stock TP-Link web UI
           - *-ubifs-factory.ubi — factory image (TFTP/recovery)
           - *-ubifs-sysupgrade.bin — upgrade an existing OpenWrt install (sysupgrade -F)" || true
-          gh release upload "$TAG" /work/out/* --clobber
+          gh release upload "$TAG" "$RUNNER_TEMP/out/"* --clobber
