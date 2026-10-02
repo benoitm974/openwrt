@@ -1,0 +1,55 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: accept the bridge MAC on
+ routed egress
+
+A routed flow offered by the flowtable rewrites the ethernet source to
+the address of the device the route resolves through. Behind a software
+bridge that device is the bridge, and a bridge does not rewrite the
+source of frames it forwards, so such a flow egresses a member port
+carrying the bridge address. The egress sanity check only accepted the
+member address and declined every routed flow (the reply direction on
+this board, both directions of routed IPv6), with hardware entries
+never installed.
+
+Accept the address of the egress device master as well. DSA setups are
+unaffected: a conduit and its user ports share one address, so the
+master comparison was already true there.
+
+Measured on TP-Link Archer BE800 (IPQ9574, non-DSA ports under a
+software bridge): routed IPv6 now offloads both directions at 2.32
+Gbit/s with the CPU port seeing 226 packets per 15 s transfer (was:
+line rate through the CPU, flows declined "eth mangle src ... !=
+egress ... mac"); IPv4 NAT unchanged (9 CPU packets per transfer).
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-02 07:33:49.570001752 +0000
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c	2026-10-02 07:33:49.570001752 +0000
+@@ -940,6 +940,16 @@
+ 	return true;
+ }
+ 
++// Routed traffic egressing a bridge member keeps the bridge MAC as
++// source (a bridge does not rewrite it), so the valid egress source MAC
++// is the member address or that of its master.
++static const u8 *ppe_offload_egress_l3_mac(struct net_device *dev)
++{
++	struct net_device *master = netdev_master_upper_dev_get(dev);
++
++	return master ? master->dev_addr : dev->dev_addr;
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+@@ -1451,7 +1461,9 @@
+ 	 * Behind a DSA user port that is the conduit's MAC, which its
+ 	 * user ports and (by default) their bridge inherit.
+ 	 */
+-	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr))
++	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr) &&
++	    !ether_addr_equal(eth.bytes + ETH_ALEN,
++			      ppe_offload_egress_l3_mac(egress.dev)))
+ 		return ppe_offload_decline("eth mangle src %pM != egress %s mac %pM",
+ 					    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
+ 					    egress.dev->dev_addr);
