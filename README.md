@@ -43,10 +43,13 @@ The same flowtable-driven model was pioneered upstream for MediaTek
 (`mtk_ppe`) and is proposed for older Qualcomm PPEs in
 [openwrt/openwrt#24806](https://github.com/openwrt/openwrt/pull/24806).
 
-Measured on one BE800 (iperf3, 2.5G link, NAT): **2.35 Gbit/s line rate in
-both directions at ~2.4% router CPU** (~15.7% CPU with offload off). See the
-flint3 issue above for details. All credit for the offload belongs to its
-author; this fork only ported and tested it.
+Measured on one BE800 (iperf3, 2.5G link): **IPv4 NAT 2.35 Gbit/s and routed
+IPv6 2.32 Gbit/s, both directions in hardware** (CPU port sees a few hundred
+packets per line-rate transfer; ~15.7% CPU with offload off). All credit for
+the offload belongs to its author; this fork ported and tested it, and
+carries three fixes reviewed at flint3: [#101 flow table depth per SoC](https://github.com/perceival/openwrt-flint3/pull/101),
+[#102 MY_MAC ingress bitmap](https://github.com/perceival/openwrt-flint3/pull/102),
+[#103 bridge-aware path checks](https://github.com/perceival/openwrt-flint3/pull/103).
 
 ## Status
 
@@ -58,7 +61,7 @@ author; this fork only ported and tested it.
 | 10G RJ45 port (AQR113C) | working |
 | Wi-Fi 7, all three bands (ath12k) | working; radio order stabilized by a local patch (see known issues) |
 | Routed + NAT forwarding | working |
-| **PPE hardware NAT/routing offload** | **working** (see above) |
+| **PPE hardware NAT/routing offload, IPv4 + IPv6** | **working both directions, both families** (see above) |
 | LED matrix (front panel) | supported by `ledmatrixd` + LuCI app |
 | Buttons | mapped |
 | UBIFS sysupgrade | working |
