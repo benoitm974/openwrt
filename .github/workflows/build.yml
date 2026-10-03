@@ -23,7 +23,8 @@ jobs:
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: ~/.ccache
+          # OpenWrt writes ccache to $(TOPDIR)/.ccache (rules.mk), not ~/.ccache.
+          path: .ccache
           key: ccache-be800-${{ github.sha }}
           restore-keys: ccache-be800-
 
