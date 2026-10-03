@@ -1,0 +1,398 @@
+From: Benoit Masson <yahoo@perenite.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: offload PPPoE session flows
+
+A flow whose egress resolves through a PPPoE device arrives from the
+flowtable as a redirect to the plain EDMA netdevice plus a
+FLOW_ACTION_PPPOE_PUSH carrying the session id; the driver declined
+those ("action id=30 unsupported") and every PPPoE uplink flow crossed
+the CPU, while the hardware already has all the encapsulation plumbing:
+the egress L3 interface table carries a PPPoE enable and session id,
+and the ingress L3 interface table a PPPoE parsing enable.
+
+Handle the action by cloning the egress port's L3 interface entry into
+one of 32 indices reserved at the top of the egress table, with the
+encapsulation enabled and the session id set, and pointing the flow's
+nexthop at the clone; non-PPPoE traffic of the same port keeps the
+plain entry. The clone is pooled per (port, session id) and released
+with the flow.
+
+The reply direction arrives as a DNAT flow whose translated address is
+the session's own PPP address -- not an address of the ingress port --
+which the plain-routed DNAT guard rejects. Accept it when the address
+belongs to a tracked PPP session of that ingress port; the session's
+PPP netdevice is resolved from the forward direction's translated
+source address at clone-creation time.
+
+Programming a session also enables PPPoE parsing on the port's ingress
+L3 interface, which the reply direction's decapsulation lookup needs;
+the bit is cleared again when the port's last session goes away.
+
+Signed-off-by: Benoit Masson <yahoo@perenite.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -194,6 +194,7 @@
+ #include "ppe_host_ipv4.h"
+ #include "ppe_host_ipv6.h"
+ #include "ppe_host_pool.h"
++#include "ppe_l3_if.h"
+ #include "ppe_nexthop.h"
+ #include "ppe_nexthop_pool.h"
+ #include "ppe_offload.h"
+@@ -233,6 +234,12 @@
+ 	u32 host_index;
+ 	u32 nexthop_index;
+ 	u32 pub_ip_index;
++	/* Egress L3 interface clone of a PPPoE session, when
++	 * @pppoe_eg_valid; the index lives in the reserved top range of
++	 * the egress L3 interface table.
++	 */
++	u32 pppoe_eg_index;
++	bool pppoe_eg_valid;
+ 	bool flow_valid;
+ 	/* Only an SNAT flow holds a public IP table entry. */
+ 	bool pub_ip_valid;
+@@ -330,11 +337,43 @@
+  * @fdb_moves: Move work items queued and not yet done, see
+  * PPE_OFFLOAD_FDB_MOVES_MAX.
+  */
++/* Number of egress L3 interface indices reserved for PPPoE sessions,
++ * taken from the top of the table. Port L3 interfaces are low, one per
++ * port, so the ranges cannot meet.
++ */
++#define PPE_OFFLOAD_PPPOE_EG_MAX 32
++#define PPE_OFFLOAD_PPPOE_EG_FIRST (PPE_EG_L3_IF_TBL_ENTRIES - PPE_OFFLOAD_PPPOE_EG_MAX)
++
++/* A PPPoE session's egress L3 interface clone: the port's own entry
++ * copied with the encapsulation enabled and the session id set. Flows of
++ * that session point their nexthop at the clone, so non-PPPoE traffic of
++ * the same port keeps the plain entry.
++ */
++struct ppe_offload_pppoe_eg {
++	struct list_head list;
++	u16 base_l3_if;
++	u16 sid;
++	/* The PPP netdevice of the session, resolved from the flow's
++	 * translated source address at add time; the reply-direction
++	 * acceptance below turns on it. Reference-held for the entry's
++	 * lifetime.
++	 */
++	struct net_device *ppp_dev;
++	refcount_t ref;
++};
++
+ struct ppe_offload_priv {
+ 	struct ppe_device *ppe_dev;
+ 	struct ppe_host_pool host_pool;
+ 	struct ppe_nexthop_pool nexthop_pool;
+ 	struct ppe_pub_ip_pool pub_ip_pool;
++	/* Dedicated egress L3 interface indices carrying a PPPoE
++	 * encapsulation, one per (port, session id); see
++	 * ppe_offload_pppoe_eg_get_and_ref().
++	 */
++	struct ppe_offload_pppoe_eg pppoe_eg[PPE_OFFLOAD_PPPOE_EG_MAX];
++	struct list_head pppoe_eg_free;
++	struct list_head pppoe_eg_active;
+ 	struct rhashtable flow_table;
+ 	struct ppe_offload_flow_entry **flow_owner;
+ 	bool tcp_exceptions_ok;
+@@ -950,6 +989,148 @@
+ 	return master ? master->dev_addr : dev->dev_addr;
+ }
+ 
++/* Take a reference on the egress L3 interface clone of (base_l3_if,
++ * sid), programming a fresh one into a reserved index when the session
++ * is not yet active. Also enables PPPoE parsing on the port's ingress
++ * L3 interface, which the reply direction's decapsulation lookup needs.
++ */
++static int ppe_offload_pppoe_eg_get_and_ref(struct ppe_offload_priv *priv,
++					    u16 base_l3_if, u16 sid,
++					    struct net_device *ppp_dev, u32 *index)
++{
++	struct ppe_device *ppe_dev = priv->ppe_dev;
++	struct ppe_l3_if_eg_entry eg;
++	struct ppe_l3_if_in_entry in;
++	struct ppe_offload_pppoe_eg *e;
++	u32 clone;
++	int ret;
++
++	list_for_each_entry(e, &priv->pppoe_eg_active, list) {
++		if (e->base_l3_if == base_l3_if && e->sid == sid) {
++			refcount_inc(&e->ref);
++			*index = PPE_OFFLOAD_PPPOE_EG_FIRST + (e - priv->pppoe_eg);
++			return 0;
++		}
++	}
++
++	e = list_first_entry_or_null(&priv->pppoe_eg_free,
++				     struct ppe_offload_pppoe_eg, list);
++	if (!e)
++		return -ENOSPC;
++
++	clone = PPE_OFFLOAD_PPPOE_EG_FIRST + (e - priv->pppoe_eg);
++
++	ret = ppe_l3_if_eg_entry_get(ppe_dev, base_l3_if, &eg);
++	if (ret)
++		return ret;
++	eg.pppoe_en = true;
++	eg.session_id = sid;
++	ret = ppe_l3_if_eg_entry_set(ppe_dev, clone, &eg);
++	if (ret)
++		return ret;
++
++	ret = ppe_l3_if_in_entry_get(ppe_dev, base_l3_if, &in);
++	if (ret)
++		goto undo_clone;
++	in.pppoe_en = true;
++	ret = ppe_l3_if_in_entry_set(ppe_dev, base_l3_if, &in);
++	if (ret)
++		goto undo_clone;
++
++	e->base_l3_if = base_l3_if;
++	e->sid = sid;
++	e->ppp_dev = ppp_dev;
++	if (ppp_dev)
++		dev_hold(ppp_dev);
++	refcount_set(&e->ref, 1);
++	list_move_tail(&e->list, &priv->pppoe_eg_active);
++
++	*index = clone;
++	return 0;
++
++undo_clone:
++	{
++		struct ppe_l3_if_eg_entry zero = {};
++
++		ppe_l3_if_eg_entry_set(ppe_dev, clone, &zero);
++	}
++	return ret;
++}
++
++/* Whether @dst is the address of a PPP session whose flows egress (and
++ * whose replies ingress) L3 interface @ingress_l3_if: the reply of a
++ * PPPoE-offloaded flow is acceptable although the address belongs to
++ * the PPP netdevice, not the ingress port itself.
++ */
++static bool ppe_offload_pppoe_reply_on_ingress(struct ppe_offload_priv *priv,
++					       __be32 dst, u32 ingress_l3_if,
++					       struct net *net)
++{
++	struct net_device *pdev;
++	struct ppe_offload_pppoe_eg *e;
++	bool found = false;
++
++	if (ingress_l3_if == PPE_OFFLOAD_L3_IF_NONE)
++		return false;
++
++	/* __ip_dev_find() needs its caller in an RCU read section; the
++	 * caller sits outside the ingress-resolution one. Called under
++	 * priv->lock.
++	 */
++	rcu_read_lock();
++	pdev = __ip_dev_find(net, dst, false);
++	if (pdev && pdev->type == ARPHRD_PPP) {
++		list_for_each_entry(e, &priv->pppoe_eg_active, list) {
++			if (e->ppp_dev == pdev && e->base_l3_if == ingress_l3_if) {
++				found = true;
++				break;
++			}
++		}
++	}
++	rcu_read_unlock();
++
++	return found;
++}
++
++/* Drop a clone reference; the last one clears the clone and, when the
++ * port carries no other session, the ingress PPPoE parsing bit.
++ */
++static void ppe_offload_pppoe_eg_deref(struct ppe_offload_priv *priv, u32 index)
++{
++	struct ppe_device *ppe_dev = priv->ppe_dev;
++	struct ppe_l3_if_eg_entry zero = {};
++	struct ppe_l3_if_in_entry in;
++	struct ppe_offload_pppoe_eg *e, *other;
++	u16 base;
++
++	if (index < PPE_OFFLOAD_PPPOE_EG_FIRST || index >= PPE_EG_L3_IF_TBL_ENTRIES)
++		return;
++	e = &priv->pppoe_eg[index - PPE_OFFLOAD_PPPOE_EG_FIRST];
++
++	if (!refcount_dec_and_test(&e->ref))
++		return;
++
++	base = e->base_l3_if;
++	ppe_l3_if_eg_entry_set(ppe_dev, index, &zero);
++	if (e->ppp_dev) {
++		dev_put(e->ppp_dev);
++		e->ppp_dev = NULL;
++	}
++	e->base_l3_if = 0;
++	e->sid = 0;
++	list_move(&e->list, &priv->pppoe_eg_free);
++
++	list_for_each_entry(other, &priv->pppoe_eg_active, list) {
++		if (other->base_l3_if == base)
++			return;
++	}
++
++	if (!ppe_l3_if_in_entry_get(ppe_dev, base, &in)) {
++		in.pppoe_en = false;
++		ppe_l3_if_in_entry_set(ppe_dev, base, &in);
++	}
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     struct flow_cls_offload *cls)
+@@ -977,8 +1158,10 @@
+ 	u32 host_words[PPE_HOST_TBL_IPV6_ENTRY_WORDS];
+ 	unsigned int flow_num_words, flow_slots, host_num_words;
+ 	u32 host_index, nexthop_index, pub_ip_index = 0, flow_index;
++	u32 pppoe_index = 0;
+ 	const struct flow_action_entry *act;
+ 	bool vlan_push_seen = false;
++	bool pppoe_seen = false;
+ 	bool ingress_vlan_bad = false;
+ 	bool dst_on_ingress = false;
+ 	bool src_via_ingress = false;
+@@ -990,6 +1173,7 @@
+ 	unsigned int vlan_pops = 0;
+ 	u16 ingress_vlan_vid = 0;
+ 	u16 vlan_push_vid = 0;
++	u16 pppoe_sid = 0;
+ 	unsigned int pmtu;
+ 	bool snat = false;
+ 	u8 ip_proto;
+@@ -1311,6 +1495,19 @@
+ 			vlan_push_seen = true;
+ 			vlan_push_vid = act->vlan.vid;
+ 			break;
++		case FLOW_ACTION_PPPOE_PUSH:
++			/* The flowtable resolved a PPPoE upper down to the
++			 * plain EDMA device and hands the session over as
++			 * this action; the encapsulation itself is carried
++			 * by a dedicated egress L3 interface clone below.
++			 */
++			if (pppoe_seen)
++				return ppe_offload_decline("second pppoe header unsupported");
++			if (!act->pppoe.sid)
++				return ppe_offload_decline("pppoe session id 0");
++			pppoe_seen = true;
++			pppoe_sid = act->pppoe.sid;
++			break;
+ 		case FLOW_ACTION_VLAN_POP:
+ 			/* The parser has already classified past the ingress
+ 			 * tag and routed egress rebuilds L2 from the nexthop, so
+@@ -1443,7 +1640,9 @@
+ 	} else if (new_src != match_src && new_dst == match_dst && l4.dest == match_dport) {
+ 		snat = true;
+ 	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
+-		if (!dst_on_ingress)
++		if (!dst_on_ingress &&
++		    !ppe_offload_pppoe_reply_on_ingress(priv, match_dst, ingress_l3_if,
++						       dev_net(netdev)))
+ 			return ppe_offload_decline("dnat of %pI4, not an address of ingress %d",
+ 						    &match_dst, meta.key->ingress_ifindex);
+ 		snat = false;
+@@ -1533,6 +1732,25 @@
+ 	 */
+ 	nexthop.port = port_priv->ppe_port->port_id;
+ 	nexthop.post_l3_if = port_priv->l3_if_index;
++	if (pppoe_seen) {
++		struct net_device *ppp_dev = NULL;
++
++		/* Swap in the session's clone before the nexthop is pooled:
++		 * post_l3_if is part of the pool key, so session and
++		 * non-session nexthops never merge. The SNAT shape's
++		 * translated source is the session's own address, which
++		 * names its PPP netdevice for the reply-direction check.
++		 */
++		if (!ipv6 && new_src != match_src)
++			ppp_dev = __ip_dev_find(dev_net(netdev), new_src, false);
++		ret = ppe_offload_pppoe_eg_get_and_ref(priv, port_priv->l3_if_index,
++						       pppoe_sid, ppp_dev, &pppoe_index);
++		if (ret) {
++			stage = "pppoe_eg";
++			goto deref_pub_ip;
++		}
++		nexthop.post_l3_if = pppoe_index;
++	}
+ 	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
+ 	if (snat)
+ 		nexthop.pub_addr_index = pub_ip_index;
+@@ -1547,7 +1765,7 @@
+ 					    &nexthop_index);
+ 	if (ret) {
+ 		stage = "nexthop";
+-		goto deref_pub_ip;
++		goto deref_pppoe;
+ 	}
+ 
+ 	/* Host entry for the original (pre-NAT) source address, for both
+@@ -1675,6 +1893,8 @@
+ 	entry->host_index = host_index;
+ 	entry->nexthop_index = nexthop_index;
+ 	entry->pub_ip_index = pub_ip_index;
++	entry->pppoe_eg_index = pppoe_index;
++	entry->pppoe_eg_valid = pppoe_seen;
+ 	entry->pub_ip_valid = pub_ip;
+ 	entry->flow_valid = true;
+ 
+@@ -1729,6 +1949,9 @@
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, host_index);
+ deref_nexthop:
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
++deref_pppoe:
++	if (pppoe_seen)
++		ppe_offload_pppoe_eg_deref(priv, pppoe_index);
+ deref_pub_ip:
+ 	if (pub_ip)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
+@@ -1794,6 +2017,8 @@
+ 		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pppoe_eg_valid)
++		ppe_offload_pppoe_eg_deref(priv, entry->pppoe_eg_index);
+ 	if (entry->pub_ip_valid)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 
+@@ -1882,6 +2107,8 @@
+ 	ppe_offload_flow_disown(priv, entry);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pppoe_eg_valid)
++		ppe_offload_pppoe_eg_deref(priv, entry->pppoe_eg_index);
+ 	if (entry->pub_ip_valid)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 	kfree(entry);
+@@ -2933,7 +3160,7 @@
+ int ppe_offload_init(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_offload_priv *priv;
+-	int ret;
++	int i, ret;
+ 
+ 	priv = devm_kzalloc(ppe_dev->dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+@@ -2943,6 +3170,10 @@
+ 	ppe_host_pool_init(&priv->host_pool);
+ 	ppe_nexthop_pool_init(&priv->nexthop_pool);
+ 	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
++	INIT_LIST_HEAD(&priv->pppoe_eg_free);
++	INIT_LIST_HEAD(&priv->pppoe_eg_active);
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_EG_MAX; i++)
++		list_add_tail(&priv->pppoe_eg[i].list, &priv->pppoe_eg_free);
+ 	mutex_init(&priv->lock);
+ 
+ 	priv->flow_owner = devm_kcalloc(ppe_dev->dev, PPE_OFFLOAD_FLOW_TBL_ENTRIES,
+@@ -3017,6 +3248,8 @@
+ 		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pppoe_eg_valid)
++		ppe_offload_pppoe_eg_deref(priv, entry->pppoe_eg_index);
+ 	if (entry->pub_ip_valid)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 	kfree(entry);
